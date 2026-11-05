@@ -1,5 +1,8 @@
 # three-environment-shadows
 
+Use environment as a source of light and _shadows_ in your Three.js scene.
+Extracts light sources from environment map automatically - no need for any more of the manually set PointLights and SunLights 🤲
+
 ```js
 import * as Three from 'three';
 import { UltraHDRLoader } from 'three/addons/loaders/UltraHDRLoader.js';
