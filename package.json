@@ -43,6 +43,10 @@
     "url": "https://discourse.threejs.org/u/mjurczyk"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mjurczyk/three-environment-shadows.git"
+  },
   "peerDependencies": {
     "three": ">=0.163.0"
   },
