@@ -1,5 +1,5 @@
 // NOTE Compile-time check of the type declarations (`tsc` in `npm test`)
-import { DataTexture, DirectionalLight, Scene, Sphere, Vector3 } from 'three';
+import { DataTexture, DirectionalLight, Scene, Vector3 } from 'three';
 import {
   EnvironmentLightExtractor,
   EnvironmentShadowLights,
@@ -7,23 +7,24 @@ import {
   type ExtractionResult,
 } from 'three-environment-shadows';
 
-export async function usage(hdr: DataTexture, scene: Scene): Promise<void> {
-  const result: ExtractionResult = await EnvironmentLightExtractor.extract(hdr, {
-    maxLights: 2,
-    threshold: 8,
-    samples: 4,
+export async function usage(hdri: DataTexture, scene: Scene): Promise<void> {
+  scene.environment = hdri;
+
+  const shadows = new EnvironmentShadowLights(scene, { maxShadowMaps: 4, threshold: 2 });
+  shadows.bounds.set(new Vector3(0, 1, 0), 6);
+
+  shadows.addEventListener('change', () => {
+    const lights: ExtractedLight[] = shadows.result?.lights ?? [];
+    const casters: DirectionalLight[] = shadows.lights.filter((light) => light.castShadow);
+
+    shadows.maxShadowMaps = Math.max(lights.length, casters.length);
   });
 
-  const first: ExtractedLight | undefined = result.lights[0];
-  const parts: number = first ? first.partitions[first.partitions.length - 1].length : 0;
+  shadows.threshold = 4;
+  shadows.needsUpdate = true;
 
-  if (result.texture !== null) scene.environment = result.texture;
+  const result: ExtractionResult = await EnvironmentLightExtractor.extract(hdri, { samples: 4 });
+  result.texture?.dispose();
 
-  const lights = new EnvironmentShadowLights(result.lights, { maxShadowMaps: parts + 1 });
-  lights.bounds.copy(new Sphere(new Vector3(0, 1, 0), 6));
-  lights.setLights(result.lights).dispose();
-
-  const shadowCasters: DirectionalLight[] = lights.lights.filter((light) => light.castShadow);
-  lights.maxShadowMaps = shadowCasters.length;
-  scene.add(lights);
+  shadows.dispose();
 }

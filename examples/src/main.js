@@ -2,7 +2,7 @@ import * as Three from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { UltraHDRLoader } from 'three/addons/loaders/UltraHDRLoader.js';
 import GUI from 'lil-gui';
-import { EnvironmentLightExtractor, EnvironmentShadowLights } from '../../src/index.js';
+import { EnvironmentShadowLights } from '../../src/index.js';
 import packageInfo from '../../package.json';
 
 const params = {
@@ -42,7 +42,6 @@ const helpers = [];
 
 let environmentLights;
 let knot;
-let residualTexture = null;
 let request = 0;
 
 const createScene = () => {
@@ -103,7 +102,7 @@ const updateHelpers = () => {
 
   helpers.length = 0;
 
-  if (!params.helpers) return;
+  if (!params.helpers || !params.shadows) return;
 
   for (const light of environmentLights.lights) {
     const helper = new Three.DirectionalLightHelper(light, 0.5);
@@ -112,8 +111,10 @@ const updateHelpers = () => {
   }
 };
 
-const updateAnalysis = (result) => {
-  if (result === null) {
+const updateAnalysis = () => {
+  const result = environmentLights.result;
+
+  if (result === null || !params.shadows) {
     analysis.textContent = '';
     return;
   }
@@ -141,45 +142,26 @@ const updateEnvironment = async () => {
 
   if (currentRequest !== request) return;
 
-  const quality = qualities[params.quality];
-
-  let result = null;
-
-  if (params.shadows) {
-    result = await EnvironmentLightExtractor.extract(texture, {
-      maxLights: quality.maxLights,
-      samples: quality.samples,
-      threshold: params.threshold,
-    });
-
-    if (currentRequest !== request) {
-      result.texture.dispose();
-      return;
-    }
-  }
-
-  if (residualTexture !== null) residualTexture.dispose();
-
+  // NOTE EnvironmentShadowLights finds the lights of the new environment map
   scene.background = texture;
+  scene.environment = texture;
+};
 
-  if (result === null) {
-    // NOTE The original environment, without shadows
-    residualTexture = null;
-    scene.environment = texture;
-    environmentLights.setLights([]);
+const updateQuality = () => {
+  Object.assign(environmentLights, qualities[params.quality], { threshold: params.threshold });
+  environmentLights.needsUpdate = true;
+};
+
+const updateShadows = () => {
+  // NOTE Removing the group puts the original environment map back
+  if (params.shadows) {
+    scene.add(environmentLights);
   } else {
-    // NOTE The extracted lights are removed from the environment, so the scene is not lit twice
-    residualTexture = result.texture;
-    scene.environment = residualTexture;
-
-    environmentLights.samples = quality.samples;
-    environmentLights.maxShadowMaps = quality.maxShadowMaps;
-    environmentLights.mapSize = quality.mapSize;
-    environmentLights.setLights(result.lights);
+    scene.remove(environmentLights);
   }
 
   updateHelpers();
-  updateAnalysis(result);
+  updateAnalysis();
 };
 
 const init = () => {
@@ -201,15 +183,21 @@ const init = () => {
 
   createScene();
 
-  environmentLights = new EnvironmentShadowLights();
+  environmentLights = new EnvironmentShadowLights(scene, {
+    ...qualities[params.quality],
+    threshold: params.threshold,
+  });
   environmentLights.bounds.set(new Three.Vector3(0, 1, 0), 6);
-  scene.add(environmentLights);
+  environmentLights.addEventListener('change', () => {
+    updateHelpers();
+    updateAnalysis();
+  });
 
   const gui = new GUI();
   gui.add(params, 'environment', environments).onChange(updateEnvironment);
-  gui.add(params, 'quality', Object.keys(qualities)).onChange(updateEnvironment);
-  gui.add(params, 'threshold', 2, 32, 1).name('threshold (x mean)').onChange(updateEnvironment);
-  gui.add(params, 'shadows').name('environment shadows').onChange(updateEnvironment);
+  gui.add(params, 'quality', Object.keys(qualities)).onChange(updateQuality);
+  gui.add(params, 'threshold', 2, 32, 1).name('threshold (x mean)').onChange(updateQuality);
+  gui.add(params, 'shadows').name('environment shadows').onChange(updateShadows);
   gui.add(params, 'helpers').onChange(updateHelpers);
 
   window.addEventListener('resize', () => {

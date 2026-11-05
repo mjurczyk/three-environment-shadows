@@ -1,3 +1,10 @@
+# v1.0.x
+
+Core:
+
+- `EnvironmentShadowLights` reads `scene.environment`: `new EnvironmentShadowLights(scene)`
+- Replace `setLights()` with `needsUpdate` and the `change` event
+
 # v0.1.x
 
 Core:

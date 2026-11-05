@@ -1,6 +1,6 @@
 {
   "name": "three-environment-shadows",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Use HDR / EXR / UltraHDR environment maps as source of light and shadows in Three.js.",
   "type": "module",
   "main": "./index.js",
