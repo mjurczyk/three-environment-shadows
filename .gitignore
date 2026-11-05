@@ -1,0 +1,7 @@
+# General
+node_modules
+build
+.DS_Store
+
+# Examples
+examples/dist
