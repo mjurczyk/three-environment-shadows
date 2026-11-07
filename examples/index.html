@@ -21,22 +21,6 @@
         height: 100vh;
       }
 
-      #analysis {
-        position: absolute;
-        top: 8px;
-        left: 8px;
-        max-width: calc(100vw - 280px);
-        padding: 6px 8px;
-        font-size: 13px;
-        color: #ffffff;
-        background-color: rgba(0, 0, 0, 0.6);
-        border-radius: 4px;
-        z-index: 1;
-      }
-
-      #analysis:empty {
-        display: none;
-      }
 
       .bottom-tab {
         position: absolute;
@@ -68,7 +52,6 @@
 
       /* NOTE ?test=1 (visual tests): only the canvas */
       body.test .lil-gui,
-      body.test #analysis,
       body.test .bottom-tab,
       body.test .stats {
         display: none !important;
@@ -76,7 +59,6 @@
     </style>
   </head>
   <body>
-    <div id="analysis"></div>
     <div class="bottom-tab">
       <div>
         <a href="https://github.com/mjurczyk/three-environment-shadows" target="_blank">

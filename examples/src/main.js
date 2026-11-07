@@ -6,16 +6,24 @@ import GUI from 'lil-gui';
 import xatlasWasmUrl from 'xatlas-web/dist/xatlas-web.wasm?url';
 import packageInfo from '../../package.json';
 
+// NOTE Only the visual tests (test/visual) pass query params: renderer, env and test (no UI, a ready state)
 const search = new URLSearchParams(location.search);
+const TEST = search.get('test') === '1';
 
-const params = {
-  renderer: search.get('renderer') === 'webgpu' ? 'webgpu' : 'webgl',
-  environment: search.get('env') ?? 'studio_rgb',
-  animate: search.get('animate') === '1',
+// NOTE The renderer choice survives the reload that switches it
+const readRenderer = () => {
+  try {
+    return search.get('renderer') ?? sessionStorage.getItem('renderer');
+  } catch {
+    return search.get('renderer');
+  }
 };
 
-// NOTE Visual tests (test/visual): no UI, a fixed view, and a ready state
-const TEST = search.get('test') === '1';
+const params = {
+  renderer: readRenderer() === 'webgpu' ? 'webgpu' : 'webgl',
+  environment: search.get('env') ?? 'studio_rgb',
+  animate: false,
+};
 
 const environments = [
   'studio_rgb',
@@ -30,7 +38,6 @@ const environments = [
   'sky_night',
 ];
 
-const analysis = document.querySelector('#analysis');
 const textures = new Map();
 
 let renderer;
@@ -50,13 +57,10 @@ const createRenderer = async () => {
     const webgpu = new WebGPURenderer({ antialias: true });
     await webgpu.init();
 
-    const backend = webgpu.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2 fallback';
-
     return {
       renderer: webgpu,
       Material: MeshStandardNodeMaterial,
       EnvironmentShadows,
-      label: `WebGPURenderer (${backend}) · TSL`,
     };
   }
 
@@ -66,7 +70,6 @@ const createRenderer = async () => {
     renderer: new THREE.WebGLRenderer({ antialias: true }),
     Material: THREE.MeshStandardMaterial,
     EnvironmentShadows,
-    label: 'WebGLRenderer · GLSL',
   };
 };
 
@@ -110,41 +113,91 @@ const createScene = (Material) => {
   });
 };
 
+// NOTE The 4096 px maps are scaled down, more on mobile
+const MOBILE =
+  /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent) ||
+  matchMedia('(pointer: coarse)').matches;
+const BACKGROUND_WIDTH = MOBILE ? 1024 : 2048;
+const ENVIRONMENT_WIDTH = MOBILE ? 512 : 1024;
+
+const halfToFloat = new Float32Array(65536).map((v, i) => THREE.DataUtils.fromHalfFloat(i));
+
+// NOTE Box filter of a half float equirect map (UltraHDRLoader)
+const scaleDown = (texture, width) => {
+  const { data, width: sourceWidth, height: sourceHeight } = texture.image;
+  const factor = Math.max(1, Math.round(sourceWidth / width));
+  const outWidth = Math.floor(sourceWidth / factor);
+  const outHeight = Math.floor(sourceHeight / factor);
+  const out = new Uint16Array(outWidth * outHeight * 4);
+  const count = factor * factor;
+
+  for (let y = 0; y < outHeight; y++) {
+    for (let x = 0; x < outWidth; x++) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+
+      for (let dy = 0; dy < factor; dy++) {
+        for (let dx = 0; dx < factor; dx++) {
+          const i = ((y * factor + dy) * sourceWidth + x * factor + dx) * 4;
+
+          r += halfToFloat[data[i]];
+          g += halfToFloat[data[i + 1]];
+          b += halfToFloat[data[i + 2]];
+        }
+      }
+
+      const o = (y * outWidth + x) * 4;
+
+      out[o] = THREE.DataUtils.toHalfFloat(r / count);
+      out[o + 1] = THREE.DataUtils.toHalfFloat(g / count);
+      out[o + 2] = THREE.DataUtils.toHalfFloat(b / count);
+      out[o + 3] = THREE.DataUtils.toHalfFloat(1);
+    }
+  }
+
+  const scaled = new THREE.DataTexture(
+    out,
+    outWidth,
+    outHeight,
+    THREE.RGBAFormat,
+    THREE.HalfFloatType,
+  );
+  scaled.mapping = THREE.EquirectangularReflectionMapping;
+  scaled.colorSpace = texture.colorSpace;
+  scaled.flipY = texture.flipY;
+  scaled.minFilter = THREE.LinearFilter;
+  scaled.magFilter = THREE.LinearFilter;
+  scaled.needsUpdate = true;
+
+  return scaled;
+};
+
 const loadEnvironment = async (name) => {
   if (!textures.has(name)) {
     const texture = await new UltraHDRLoader()
       .setPath(`${import.meta.env.BASE_URL}assets/`)
       .loadAsync(`${name}.jpg`);
-    texture.mapping = THREE.EquirectangularReflectionMapping;
-    textures.set(name, texture);
+
+    const background = scaleDown(texture, BACKGROUND_WIDTH);
+    const environment = scaleDown(background, ENVIRONMENT_WIDTH);
+
+    textures.set(name, { background, environment });
   }
 
   return textures.get(name);
 };
 
-const updateURL = () => {
-  const query = new URLSearchParams({
-    renderer: params.renderer,
-    env: params.environment,
-    animate: params.animate ? '1' : '0',
-  });
-
-  if (TEST) query.set('test', '1');
-
-  history.replaceState(null, '', `${location.pathname}?${query}`);
-};
-
 // NOTE EnvironmentShadows reads scene.environment, a new map starts a new bake
 const setEnvironment = async (name) => {
   params.environment = name;
-  updateURL();
 
-  const texture = await loadEnvironment(name);
+  const { background, environment } = await loadEnvironment(name);
 
   if (name !== params.environment) return;
 
-  scene.background = texture;
-  scene.environment = texture;
+  scene.background = background;
+  scene.environment = environment;
 };
 
 const createGUI = () => {
@@ -154,11 +207,16 @@ const createGUI = () => {
   gui
     .add(params, 'renderer', { 'WebGL (GLSL)': 'webgl', 'WebGPU (TSL)': 'webgpu' })
     .onChange(() => {
-      updateURL();
+      try {
+        sessionStorage.setItem('renderer', params.renderer);
+      } catch {
+        // NOTE Without storage the page reloads with the default renderer
+      }
+
       location.reload();
     });
   gui.add(params, 'environment', environments).onChange(setEnvironment);
-  gui.add(params, 'animate').name('animate knot').onChange(updateURL);
+  gui.add(params, 'animate').name('animate knot');
 
   const rebake = () => (shadows.needsUpdate = true);
 
@@ -202,24 +260,9 @@ const init = async () => {
 
   createScene(created.Material);
 
-  analysis.textContent = `${created.label} · unwrapping…`;
-
-  shadows = new created.EnvironmentShadows(renderer, scene, {
-    bounds: new THREE.Sphere(new THREE.Vector3(0, 1, 0), 6),
-    xatlasWasmUrl,
-  });
-
-  await shadows.ready;
-
-  analysis.textContent = created.label;
-
   stats = new Stats();
   stats.dom.classList.add('stats');
-  stats.dom.style.top = '40px';
-  stats.dom.style.left = '8px';
   document.body.appendChild(stats.dom);
-
-  createGUI();
 
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -238,13 +281,25 @@ const init = async () => {
 
     scene.updateMatrixWorld();
 
-    shadows.update(camera);
+    shadows?.update(camera);
     renderer.render(scene, camera);
 
     stats.end();
   });
 
+  // NOTE The environment and background first, the shadows bake after
   await setEnvironment(params.environment);
+
+  const environmentShadows = new created.EnvironmentShadows(renderer, scene, {
+    bounds: new THREE.Sphere(new THREE.Vector3(0, 1, 0), 6),
+    xatlasWasmUrl,
+  });
+
+  await environmentShadows.ready;
+
+  shadows = environmentShadows;
+
+  createGUI();
 
   // NOTE Ready for a screenshot when the first bake of this environment is on screen and nothing else is pending
   if (TEST) {
@@ -261,7 +316,4 @@ const init = async () => {
   }
 };
 
-init().catch((error) => {
-  console.error(error);
-  analysis.textContent = `Error: ${error.message}`;
-});
+init().catch((error) => console.error(error));
