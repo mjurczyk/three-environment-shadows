@@ -1,26 +1,24 @@
-import * as Three from 'three';
+import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { UltraHDRLoader } from 'three/addons/loaders/UltraHDRLoader.js';
+import Stats from 'three/addons/libs/stats.module.js';
 import GUI from 'lil-gui';
-import { EnvironmentShadowLights } from '../../src/index.js';
+import xatlasWasmUrl from 'xatlas-web/dist/xatlas-web.wasm?url';
 import packageInfo from '../../package.json';
 
+const search = new URLSearchParams(location.search);
+
 const params = {
-  environment: 'desert',
-  quality: 'medium',
-  threshold: 2,
-  shadows: true,
-  helpers: false,
+  renderer: search.get('renderer') === 'webgpu' ? 'webgpu' : 'webgl',
+  environment: search.get('env') ?? 'studio_rgb',
+  animate: search.get('animate') === '1',
 };
 
-// NOTE The number of lights, shadow maps and parts of large light sources
-const qualities = {
-  low: { maxLights: 1, samples: 1, maxShadowMaps: 1, mapSize: 1024 },
-  medium: { maxLights: 2, samples: 1, maxShadowMaps: 2, mapSize: 2048 },
-  high: { maxLights: 2, samples: 4, maxShadowMaps: 8, mapSize: 1024 },
-};
+// NOTE Visual tests (test/visual): no UI, a fixed view, and a ready state
+const TEST = search.get('test') === '1';
 
 const environments = [
+  'studio_rgb',
   'desert',
   'grassland',
   'shore',
@@ -32,52 +30,80 @@ const environments = [
   'sky_night',
 ];
 
-const renderer = new Three.WebGLRenderer({ antialias: true });
-const scene = new Three.Scene();
-const camera = new Three.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
-const loader = new UltraHDRLoader().setPath(`${import.meta.env.BASE_URL}assets/`);
 const analysis = document.querySelector('#analysis');
 const textures = new Map();
-const helpers = [];
 
-let environmentLights;
+let renderer;
+let scene;
+let camera;
+let controls;
+let shadows;
 let knot;
-let request = 0;
+let stats;
 
-const createScene = () => {
-  const ground = new Three.Mesh(
-    new Three.CircleGeometry(6, 64),
-    new Three.MeshStandardMaterial({ color: 0xbbbbbb, roughness: 0.9 }),
+// NOTE WebGLRenderer uses the GLSL version, WebGPURenderer (WebGPU or its WebGL 2 fallback) the TSL version
+const createRenderer = async () => {
+  if (params.renderer === 'webgpu') {
+    const { WebGPURenderer, MeshStandardNodeMaterial } = await import('three/webgpu');
+    const { EnvironmentShadows } = await import('../../src/webgpu.js');
+
+    const webgpu = new WebGPURenderer({ antialias: true });
+    await webgpu.init();
+
+    const backend = webgpu.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2 fallback';
+
+    return {
+      renderer: webgpu,
+      Material: MeshStandardNodeMaterial,
+      EnvironmentShadows,
+      label: `WebGPURenderer (${backend}) · TSL`,
+    };
+  }
+
+  const { EnvironmentShadows } = await import('../../src/index.js');
+
+  return {
+    renderer: new THREE.WebGLRenderer({ antialias: true }),
+    Material: THREE.MeshStandardMaterial,
+    EnvironmentShadows,
+    label: 'WebGLRenderer · GLSL',
+  };
+};
+
+const createScene = (Material) => {
+  const ground = new THREE.Mesh(
+    new THREE.CircleGeometry(6, 64),
+    new Material({ color: 0xbbbbbb, roughness: 0.9 }),
   );
   ground.rotation.x = -Math.PI / 2;
-  ground.receiveShadow = true;
   scene.add(ground);
 
-  const material = new Three.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 });
-  const metal = new Three.MeshStandardMaterial({ color: 0xffffff, roughness: 0.2, metalness: 1 });
+  const material = new Material({ color: 0xffffff, roughness: 0.4 });
+  const metal = new Material({ color: 0xffffff, roughness: 0.2, metalness: 1 });
 
-  knot = new Three.Mesh(new Three.TorusKnotGeometry(0.8, 0.3, 128, 32), material);
+  knot = new THREE.Mesh(new THREE.TorusKnotGeometry(0.8, 0.3, 128, 32), material);
   knot.position.set(0, 1.8, 0);
   scene.add(knot);
 
-  const box = new Three.Mesh(new Three.BoxGeometry(1.2, 2.4, 1.2), material);
+  const box = new THREE.Mesh(new THREE.BoxGeometry(1.2, 2.4, 1.2), material);
   box.position.set(-2.5, 1.2, -1);
   box.rotation.y = 0.4;
   scene.add(box);
 
-  const sphere = new Three.Mesh(new Three.SphereGeometry(0.7, 64, 32), metal);
+  const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.7, 64, 32), metal);
   sphere.position.set(2.4, 0.7, 1.2);
   scene.add(sphere);
 
   for (let i = 0; i < 8; i++) {
-    const pillar = new Three.Mesh(new Three.CylinderGeometry(0.12, 0.12, 2, 16), material);
+    const pillar = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 2, 16), material);
     const angle = (i / 8) * Math.PI * 2;
     pillar.position.set(Math.cos(angle) * 4.5, 1, Math.sin(angle) * 4.5);
     scene.add(pillar);
   }
 
+  // NOTE Every mesh casts and receives, the ground also blocks the light from below the horizon
   scene.traverse((object) => {
-    if (object.isMesh && object !== ground) {
+    if (object.isMesh) {
       object.castShadow = true;
       object.receiveShadow = true;
     }
@@ -86,142 +112,156 @@ const createScene = () => {
 
 const loadEnvironment = async (name) => {
   if (!textures.has(name)) {
-    const texture = await loader.loadAsync(`${name}.jpg`);
-    texture.mapping = Three.EquirectangularReflectionMapping;
+    const texture = await new UltraHDRLoader()
+      .setPath(`${import.meta.env.BASE_URL}assets/`)
+      .loadAsync(`${name}.jpg`);
+    texture.mapping = THREE.EquirectangularReflectionMapping;
     textures.set(name, texture);
   }
 
   return textures.get(name);
 };
 
-const updateHelpers = () => {
-  for (const helper of helpers) {
-    scene.remove(helper);
-    helper.dispose();
-  }
-
-  helpers.length = 0;
-
-  if (!params.helpers || !params.shadows) return;
-
-  for (const light of environmentLights.lights) {
-    const helper = new Three.DirectionalLightHelper(light, 0.5);
-    scene.add(helper);
-    helpers.push(helper);
-  }
-};
-
-const updateAnalysis = () => {
-  const result = environmentLights.result;
-
-  if (result === null || !params.shadows) {
-    analysis.textContent = '';
-    return;
-  }
-
-  const lights = result.lights.map((light) => {
-    const percent = (light.energyFraction * 100).toFixed(0);
-    const cone = Three.MathUtils.radToDeg(light.coneAngle).toFixed(1);
-
-    return `${percent}% / ${cone}°`;
+const updateURL = () => {
+  const query = new URLSearchParams({
+    renderer: params.renderer,
+    env: params.environment,
+    animate: params.animate ? '1' : '0',
   });
 
-  const shadowMaps = environmentLights.lights.filter((light) => light.castShadow).length;
+  if (TEST) query.set('test', '1');
 
-  analysis.textContent =
-    `directionality ${result.directionality.toFixed(2)} · ` +
-    `lights (energy / cone): ${lights.length > 0 ? lights.join(', ') : 'none'} · ` +
-    `${shadowMaps} shadow map(s)`;
+  history.replaceState(null, '', `${location.pathname}?${query}`);
 };
 
-const updateEnvironment = async () => {
-  // NOTE Ignore the results of older requests
-  const currentRequest = ++request;
+// NOTE EnvironmentShadows reads scene.environment, a new map starts a new bake
+const setEnvironment = async (name) => {
+  params.environment = name;
+  updateURL();
 
-  const texture = await loadEnvironment(params.environment);
+  const texture = await loadEnvironment(name);
 
-  if (currentRequest !== request) return;
+  if (name !== params.environment) return;
 
-  // NOTE EnvironmentShadowLights finds the lights of the new environment map
   scene.background = texture;
   scene.environment = texture;
 };
 
-const updateQuality = () => {
-  Object.assign(environmentLights, qualities[params.quality], { threshold: params.threshold });
-  environmentLights.needsUpdate = true;
+const createGUI = () => {
+  const gui = new GUI({ title: 'three-environment-shadows' });
+
+  // NOTE The renderer cannot change at runtime, the page reloads
+  gui
+    .add(params, 'renderer', { 'WebGL (GLSL)': 'webgl', 'WebGPU (TSL)': 'webgpu' })
+    .onChange(() => {
+      updateURL();
+      location.reload();
+    });
+  gui.add(params, 'environment', environments).onChange(setEnvironment);
+  gui.add(params, 'animate').name('animate knot').onChange(updateURL);
+
+  const rebake = () => (shadows.needsUpdate = true);
+
+  const folder = gui.addFolder('EnvironmentShadows');
+  folder.add(shadows, 'samplesPerFrame', 0, 1000, 1).name('shadow maps / frame');
+  folder.add(shadows, 'samplesPerBake', 0, 1000, 1).name('samples / bake').onChange(rebake);
+  folder.add(shadows, 'fadeTime', 0, 2, 0.05).name('crossfade (s)');
+  folder.add(shadows, 'atlasSize', [512, 1024, 2048, 4096]).name('atlas size');
+  folder.add(shadows, 'mapSize', [512, 1024, 2048, 4096]).name('shadow map size');
+  folder.add(shadows, 'shadowNoise', 0, 1000, 0.1).name('shadow noise (texels)').onChange(rebake);
+  folder
+    .add(shadows, 'directionJitter', 0, 1000, 0.1)
+    .name('direction jitter (deg)')
+    .onChange(rebake);
+  folder.add(shadows, 'frustumAtlas').name('atlas: only meshes in view');
+  folder.add(shadows, 'frustumMargin', 0, 1000, 1).name('view margin (%)');
+  folder.add(shadows, 'specularOcclusion').name('specular occlusion');
 };
 
-const updateShadows = () => {
-  // NOTE Removing the group puts the original environment map back
-  if (params.shadows) {
-    scene.add(environmentLights);
-  } else {
-    scene.remove(environmentLights);
-  }
-
-  updateHelpers();
-  updateAnalysis();
-};
-
-const init = () => {
+const init = async () => {
   document.querySelector('.package-version').textContent = `v${packageInfo.version}`;
 
-  renderer.setPixelRatio(window.devicePixelRatio);
+  if (TEST) document.body.classList.add('test');
+
+  const created = await createRenderer();
+
+  renderer = created.renderer;
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = Three.PCFShadowMap;
-  renderer.toneMapping = Three.ACESFilmicToneMapping;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
   document.body.appendChild(renderer.domElement);
 
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
   camera.position.set(8, 5, 10);
 
-  const controls = new OrbitControls(camera, renderer.domElement);
+  controls = new OrbitControls(camera, renderer.domElement);
   controls.target.set(0, 1, 0);
   controls.maxPolarAngle = Math.PI / 2;
   controls.update();
 
-  createScene();
+  createScene(created.Material);
 
-  environmentLights = new EnvironmentShadowLights(scene, {
-    ...qualities[params.quality],
-    threshold: params.threshold,
-  });
-  environmentLights.bounds.set(new Three.Vector3(0, 1, 0), 6);
-  environmentLights.addEventListener('change', () => {
-    updateHelpers();
-    updateAnalysis();
+  analysis.textContent = `${created.label} · unwrapping…`;
+
+  shadows = new created.EnvironmentShadows(renderer, scene, {
+    bounds: new THREE.Sphere(new THREE.Vector3(0, 1, 0), 6),
+    xatlasWasmUrl,
   });
 
-  const gui = new GUI();
-  gui.add(params, 'environment', environments).onChange(updateEnvironment);
-  gui.add(params, 'quality', Object.keys(qualities)).onChange(updateQuality);
-  gui.add(params, 'threshold', 2, 32, 1).name('threshold (x mean)').onChange(updateQuality);
-  gui.add(params, 'shadows').name('environment shadows').onChange(updateShadows);
-  gui.add(params, 'helpers').onChange(updateHelpers);
+  await shadows.ready;
+
+  analysis.textContent = created.label;
+
+  stats = new Stats();
+  stats.dom.classList.add('stats');
+  stats.dom.style.top = '40px';
+  stats.dom.style.left = '8px';
+  document.body.appendChild(stats.dom);
+
+  createGUI();
 
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
-
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  const timer = new Three.Timer();
+  const timer = new THREE.Timer();
 
   renderer.setAnimationLoop((time) => {
-    timer.update(time);
-    knot.rotation.y += timer.getDelta() * 0.5;
+    stats.begin();
 
-    // NOTE Position the lights before the helpers read them
+    timer.update(time);
+
+    if (params.animate) knot.rotation.y += timer.getDelta() * 0.5;
+
     scene.updateMatrixWorld();
 
-    for (const helper of helpers) helper.update();
-
+    shadows.update(camera);
     renderer.render(scene, camera);
+
+    stats.end();
   });
 
-  updateEnvironment();
+  await setEnvironment(params.environment);
+
+  // NOTE Ready for a screenshot when the first bake of this environment is on screen and nothing else is pending
+  if (TEST) {
+    window.environmentShadowsTest = {
+      isReady: () =>
+        scene.environment !== null &&
+        shadows._hasFront &&
+        !shadows._baking &&
+        !shadows._dirty &&
+        !shadows._layoutPending &&
+        shadows._layoutKey === shadows._bakeKey &&
+        shadows._fade >= 1,
+    };
+  }
 };
 
-init();
+init().catch((error) => {
+  console.error(error);
+  analysis.textContent = `Error: ${error.message}`;
+});

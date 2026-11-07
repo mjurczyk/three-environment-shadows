@@ -65,6 +65,14 @@
       .bottom-tab > * {
         margin: 0px 8px;
       }
+
+      /* NOTE ?test=1 (visual tests): only the canvas */
+      body.test .lil-gui,
+      body.test #analysis,
+      body.test .bottom-tab,
+      body.test .stats {
+        display: none !important;
+      }
     </style>
   </head>
   <body>

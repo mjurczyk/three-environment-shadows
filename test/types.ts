@@ -1,30 +1,34 @@
 // NOTE Compile-time check of the type declarations (`tsc` in `npm test`)
-import { DataTexture, DirectionalLight, Scene, Vector3 } from 'three';
-import {
-  EnvironmentLightExtractor,
-  EnvironmentShadowLights,
-  type ExtractedLight,
-  type ExtractionResult,
-} from 'three-environment-shadows';
+import { PerspectiveCamera, Scene, Sphere, Vector3, WebGLRenderer } from 'three';
+import { WebGPURenderer } from 'three/webgpu';
+import { EnvironmentShadows, type EnvironmentShadowsOptions } from 'three-environment-shadows';
+import { EnvironmentShadows as EnvironmentShadowsGPU } from 'three-environment-shadows/webgpu';
 
-export async function usage(hdri: DataTexture, scene: Scene): Promise<void> {
-  scene.environment = hdri;
+export async function usage(
+  renderer: WebGLRenderer,
+  scene: Scene,
+  camera: PerspectiveCamera,
+): Promise<void> {
+  const options: EnvironmentShadowsOptions = {
+    samplesPerBake: 256,
+    bounds: new Sphere(new Vector3(0, 1, 0), 6),
+  };
+  const shadows = await new EnvironmentShadows(renderer, scene, options).ready;
 
-  const shadows = new EnvironmentShadowLights(scene, { maxShadowMaps: 4, threshold: 2 });
-  shadows.bounds.set(new Vector3(0, 1, 0), 6);
-
-  shadows.addEventListener('change', () => {
-    const lights: ExtractedLight[] = shadows.result?.lights ?? [];
-    const casters: DirectionalLight[] = shadows.lights.filter((light) => light.castShadow);
-
-    shadows.maxShadowMaps = Math.max(lights.length, casters.length);
-  });
-
-  shadows.threshold = 4;
+  shadows.shadowNoise = 4;
   shadows.needsUpdate = true;
+  shadows.update(camera);
+  shadows.dispose();
+}
 
-  const result: ExtractionResult = await EnvironmentLightExtractor.extract(hdri, { samples: 4 });
-  result.texture?.dispose();
+export async function usageWebGPU(
+  renderer: WebGPURenderer,
+  scene: Scene,
+  camera: PerspectiveCamera,
+): Promise<void> {
+  const shadows = new EnvironmentShadowsGPU(renderer, scene, { atlasSize: 512 });
+  await shadows.ready;
 
+  shadows.update(camera);
   shadows.dispose();
 }
