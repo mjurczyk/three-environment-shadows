@@ -1,3 +1,7 @@
+<a href="https://github.com/mjurczyk/three-environment-shadows" target="_blank">
+  <img width="100%" src="https://github.com/user-attachments/assets/0e4dec8a-fcde-4fbb-9d53-1f7ffd9d6d5c" title="Three Environment Shadows" />
+</a>
+
 # three-environment-shadows
 
 Use environment as a source of light and _shadows_ in your Three.js scene.
