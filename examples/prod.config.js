@@ -5,8 +5,5 @@ export default defineConfig({
   resolve: { dedupe: ['three'] },
   base: '/three-environment-shadows/',
   // NOTE three.js alone is about 600 kB
-  build: {
-    chunkSizeWarningLimit: 1000,
-    rollupOptions: { input: { main: 'index.html', demos: 'demos.html' } },
-  },
+  build: { chunkSizeWarningLimit: 1000 },
 });

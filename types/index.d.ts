@@ -1,140 +1,69 @@
-import {
-  Color,
-  DataTexture,
-  DirectionalLight,
-  Group,
-  Object3D,
-  Object3DEventMap,
-  Scene,
-  Sphere,
-  Texture,
-  Vector3,
-} from 'three';
+import type { Camera, Mesh, Scene, Sphere, WebGLRenderer } from 'three';
 
 /**
- * One part of an extracted light.
+ * Options of {@link EnvironmentShadows}, see the properties of the same name.
  */
-export interface LightPart {
-  /** Unit vector from the scene towards the part, in the space of the environment map. */
-  direction: Vector3;
-  /** The color, normalized so its largest component is `1`. */
-  color: Color;
-  /** The irradiance, usable as `DirectionalLight.intensity`. */
-  intensity: number;
-  /** Half-angle (in radians) of the cone the part emits from. */
-  coneAngle: number;
-}
-
-/**
- * A light source that was found in an environment map.
- */
-export interface ExtractedLight extends LightPart {
-  /** Fraction of the total environment energy emitted by this light. */
-  energyFraction: number;
-  /**
-   * `partitions[ n - 1 ]` divides the light into `n` parts (median cut). The energies of the
-   * parts add up to the energy of the light. `partitions[ 0 ]` holds the light as one part.
-   */
-  partitions: LightPart[][];
-}
-
-export interface ExtractionResult {
-  /** The extracted lights, strongest first. */
-  lights: ExtractedLight[];
-  /** `0` if the environment emits equally in all directions, `1` if all light comes from one direction. */
-  directionality: number;
-  /** Fraction of the total environment energy emitted by the extracted lights. */
-  dominance: number;
-  /** The radiance (luminance) above which texels are part of a light. */
-  threshold: number;
-  /** A copy of the environment map without the extracted lights, or `null`. */
-  texture: DataTexture | null;
-}
-
-export interface ExtractOptions {
-  /** The maximum number of lights. Default `2`. */
-  maxLights?: number;
-  /** Texels brighter than this factor times the mean radiance are part of a light. Default `8`. */
-  threshold?: number;
-  /** The minimum fraction of the total energy a light must emit. Default `0.05`. */
-  minEnergy?: number;
-  /** The minimum elevation (in radians) of a light, in the space of the environment map. Default `-Math.PI / 2`. */
-  minElevation?: number;
-  /** The maximum number of parts per light, see `ExtractedLight.partitions`. Default `4`. */
-  samples?: number;
-  /** The width of the grid used to group bright texels into regions. Default `512`. */
-  resolution?: number;
-  /** Whether to create a copy of the environment map without the lights. Default `true`. */
-  removeLights?: boolean;
-}
-
-/**
- * Finds the dominant light sources of an equirectangular environment map.
- */
-export class EnvironmentLightExtractor {
-  static extract(texture: Texture, options?: ExtractOptions): Promise<ExtractionResult>;
-}
-
-export interface EnvironmentShadowLightsOptions {
-  /** The maximum number of lights. Default `2`. */
-  maxLights?: number;
-  /** Texels brighter than this factor times the mean radiance are part of a light. Default `8`. */
-  threshold?: number;
-  /** The minimum fraction of the total energy a light must emit. Default `0.05`. */
-  minEnergy?: number;
-  /** The minimum elevation (in radians) of a light, in the space of the environment map. Default `-Math.PI / 2`. */
-  minElevation?: number;
-  /** The width of the grid used to group bright texels into regions. Default `512`. */
-  resolution?: number;
-  /** The maximum number of shadow casting lights per light source. Default `4`. */
-  samples?: number;
-  /** The maximum number of shadow maps of all light sources. Default `4`. */
-  maxShadowMaps?: number;
-  /** The shadow map size of each light. Default `1024`. */
+export interface EnvironmentShadowsOptions {
+  /** Shadow maps rendered per frame while a bake runs. Default 24. */
+  samplesPerFrame?: number;
+  /** Samples (shadow maps) per bake. More is smoother and slower to update. Default 512. */
+  samplesPerBake?: number;
+  /** Crossfade time in seconds from the old to the new lightmap. Default 0.3. */
+  fadeTime?: number;
+  /** Width and height of the lightmap atlas in texels. Default 1024. */
+  atlasSize?: number;
+  /** Width and height of the shadow map of each sample. Default 512. */
   mapSize?: number;
-  /** The typical distance between shadow casters and receivers, relative to the bounds radius. Default `0.1`. */
-  relativeOccluderDistance?: number;
-}
-
-export interface EnvironmentShadowLightsEventMap extends Object3DEventMap {
-  /** The light sources changed, see `EnvironmentShadowLights.result`. */
-  change: {};
+  /** Random offset of each shadow lookup, in shadow map texels. Softens stair-stepped edges. Default 8. */
+  shadowNoise?: number;
+  /** Random tilt of each sample direction, in degrees. Blends the shadows of neighboring samples. Default 2. */
+  directionJitter?: number;
+  /** Whether the baked visibility also darkens environment reflections. Default true. */
+  specularOcclusion?: boolean;
+  /** Whether only the meshes in the camera frustum get a place in the atlas. Default true. */
+  frustumAtlas?: boolean;
+  /** Growth of the bounding spheres for the frustum test, in percent. Default 20. */
+  frustumMargin?: number;
+  /** The area that receives shadows. Default: the bounds of the meshes. */
+  bounds?: Sphere;
+  /** The meshes. Default: all meshes of the scene that cast or receive shadows. */
+  meshes?: Mesh[];
+  /** URL of xatlas-web.wasm. Default: next to the bundle. */
+  xatlasWasmUrl?: string;
 }
 
 /**
- * Casts shadows from the light sources of `scene.environment`.
+ * Soft, colored shadows from the whole environment map (`scene.environment`), for WebGLRenderer.
+ * For WebGPURenderer, import it from `three-environment-shadows/webgpu`.
  */
-export class EnvironmentShadowLights extends Group<EnvironmentShadowLightsEventMap> {
-  /** Constructs the group and adds it to the scene. */
-  constructor(scene?: Scene | null, options?: EnvironmentShadowLightsOptions);
+export class EnvironmentShadows {
+  constructor(renderer: WebGLRenderer, scene: Scene, options?: EnvironmentShadowsOptions);
 
-  readonly isEnvironmentShadowLights: true;
+  readonly isEnvironmentShadows: true;
+  readonly renderer: WebGLRenderer;
+  readonly scene: Scene;
 
-  maxLights: number;
-  threshold: number;
-  minEnergy: number;
-  minElevation: number;
-  resolution: number;
-  samples: number;
-  maxShadowMaps: number;
+  samplesPerFrame: number;
+  samplesPerBake: number;
+  fadeTime: number;
+  atlasSize: number;
   mapSize: number;
-  relativeOccluderDistance: number;
-
-  /** Set to `true` to find the light sources again, e.g. after a change of the options. */
+  shadowNoise: number;
+  directionJitter: number;
+  specularOcclusion: boolean;
+  frustumAtlas: boolean;
+  frustumMargin: number;
+  /** The area that receives shadows, set when {@link ready} resolves if not given. */
+  bounds: Sphere | null;
+  /** Set to `true` to start a new bake, e.g. after a change of the options. */
   needsUpdate: boolean;
 
-  /** The area that receives shadows, in world space. */
-  bounds: Sphere;
+  /** Resolves when the meshes are unwrapped and the shadows are ready to bake. */
+  readonly ready: Promise<this>;
 
-  /** The light sources of the environment map, or `null` before they are found. */
-  readonly result: Omit<ExtractionResult, 'texture'> | null;
+  /** Bakes a few samples and swaps in finished lightmaps. Call it once per frame before rendering. */
+  update(camera: Camera): void;
 
-  /** The target of all lights, at the center of the bounds. */
-  readonly target: Object3D;
-
-  /** The lights. The shadow casting lights come first. */
-  readonly lights: DirectionalLight[];
-
-  /** Puts the original environment map back, frees the GPU-related resources and removes the group. */
+  /** Removes the patches from the materials and frees the GPU resources. */
   dispose(): void;
 }

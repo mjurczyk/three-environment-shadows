@@ -1,9 +1,13 @@
 ### Building Examples
 
-- run `npm run build:examples`
-- Commit the new docs version
-- Run `git subtree push --prefix=examples/dist/ origin gh-pages`, or:
+- Run `npm run build:examples`, the page is in `examples/dist/` (not committed).
+- Deploy it to the `gh-pages` branch:
 
 ```bash
-git push origin `git subtree split --prefix=examples/dist/ main`:gh-pages --force
+cd examples/dist
+git init -b gh-pages
+git add -A
+git commit -m "Deploy examples"
+git push --force git@github.com:mjurczyk/three-environment-shadows.git gh-pages
+rm -rf .git
 ```

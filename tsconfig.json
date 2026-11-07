@@ -7,8 +7,17 @@
     "moduleResolution": "Bundler",
     "baseUrl": ".",
     "paths": {
-      "three-environment-shadows": ["./types/index.d.ts"]
+      "three-environment-shadows": [
+        "./types/index.d.ts"
+      ],
+      "three-environment-shadows/webgpu": [
+        "./types/webgpu.d.ts"
+      ]
     }
   },
-  "files": ["types/index.d.ts", "test/types.ts"]
+  "files": [
+    "types/index.d.ts",
+    "types/webgpu.d.ts",
+    "test/types.ts"
+  ]
 }

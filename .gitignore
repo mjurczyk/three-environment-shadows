@@ -5,3 +5,6 @@ build
 
 # Examples
 examples/dist
+
+# Visual tests
+test/visual/output
