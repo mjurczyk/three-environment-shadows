@@ -83,7 +83,7 @@ async function screenshot(browser, url, renderer, environment) {
   page.on('console', (message) => message.type() === 'error' && errors.push(message.text()));
 
   await page.setViewport({ width: WIDTH, height: HEIGHT, deviceScaleFactor: 1 });
-  await page.goto(`${url}?renderer=${renderer}&env=${environment}&animate=0&test=1`);
+  await page.goto(`${url}?renderer=${renderer}&env=${environment}&test=1`);
 
   try {
     await page.waitForFunction(() => window.environmentShadowsTest?.isReady(), {
