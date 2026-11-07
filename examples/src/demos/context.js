@@ -1,17 +1,8 @@
 import * as THREE from 'three';
-import { MeshBVH, StaticGeometryGenerator } from 'three-mesh-bvh';
 
 /**
- * Shared helpers for techniques. See techniques/index.js for the technique interface.
+ * Environment map helpers for the demo.
  */
-
-// NOTE Direction of a texel center of an equirect map with row 0 at the top (v = 1), see equirectUv() in three.js
-export function texelDirection(x, y, width, height, target = new THREE.Vector3()) {
-  const phi = ((x + 0.5) / width - 0.5) * 2 * Math.PI;
-  const lat = (0.5 - (y + 0.5) / height) * Math.PI;
-
-  return target.set(Math.cos(lat) * Math.cos(phi), Math.sin(lat), Math.cos(lat) * Math.sin(phi));
-}
 
 /**
  * Box-filters an equirect DataTexture (half float, float or byte) to `width` x `width / 2`, linear RGB.
@@ -100,82 +91,4 @@ function downsampleImage(texture, width) {
   }
 
   return { data: out, width, height };
-}
-
-/** PMREM cache, one cube render target per source texture. */
-export class PMREMCache {
-  constructor(renderer) {
-    this.generator = new THREE.PMREMGenerator(renderer);
-    this.cache = new Map();
-  }
-
-  /** Returns { texture: CubeTexture (render target, mipmapped), maxLod } for an equirect texture. */
-  get(texture) {
-    if (!texture) return null;
-
-    let entry = this.cache.get(texture);
-
-    if (!entry) {
-      const target = this.generator.fromEquirectangular(texture);
-      entry = { target, texture: target.texture, maxLod: target.texture.mipmaps.length - 1 };
-      this.cache.set(texture, entry);
-    }
-
-    return entry;
-  }
-
-  clear() {
-    for (const entry of this.cache.values()) entry.target.dispose();
-
-    this.cache.clear();
-  }
-}
-
-/**
- * Merged world-space geometry + BVH of all scene meshes.
- * update() regenerates the geometry and refits the BVH when meshes moved, returns the CPU ms spent.
- */
-export class SceneBVH {
-  constructor(meshes) {
-    this.meshes = meshes;
-    this.version = 0;
-    this.lastUpdateMs = 0;
-    this.build();
-  }
-
-  build() {
-    this.geometry?.dispose();
-    this.sources = this.meshes.map((mesh) => mesh.geometry);
-    this.generator = new StaticGeometryGenerator(this.meshes);
-    this.generator.attributes = ['position', 'normal'];
-    // NOTE Groups make a multi-root BVH, MeshBVHUniformStruct supports one root only
-    this.generator.useGroups = false;
-    this.geometry = this.generator.generate();
-    this.geometry.clearGroups();
-    this.bvh = new MeshBVH(this.geometry);
-    this.geometry.boundsTree = this.bvh;
-  }
-
-  update() {
-    const start = performance.now();
-
-    // NOTE A mesh got a new geometry (e.g. the lightmap unwrap of E2): the vertex count changed, build again
-    if (this.meshes.some((mesh, i) => mesh.geometry !== this.sources[i])) {
-      this.build();
-    } else {
-      this.generator.generate(this.geometry);
-      this.geometry.clearGroups();
-      this.bvh.refit();
-    }
-
-    this.version++;
-
-    this.lastUpdateMs = performance.now() - start;
-
-    return this.lastUpdateMs;
-  }
-
-  dispose() {
-    this.geometry.dispose();
-  }
 }

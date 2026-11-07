@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
-import { buildSampler, halton } from './temporal.js';
-import { createLightmapLayout } from './lightmapLayout.js';
+import { buildSampler, halton } from './sampler.js';
+import { createLightmapLayout, createPacker, setLayout } from './lightmapLayout.js';
 
 /**
  * E2 · Background-baked lightmap (double buffered).
@@ -103,8 +103,12 @@ function createBakeMaterial(jitterUniforms) {
 
   material.onBeforeCompile = (shader) => {
     shader.vertexShader = shader.vertexShader
-      .replace('void main() {', 'attribute vec2 lightmapUv;\nvoid main() {')
-      .replace('#include <fog_vertex>', '#include <fog_vertex>\ngl_Position = vec4( lightmapUv * 2.0 - 1.0, 0.0, 1.0 );');
+      .replace('void main() {', 'attribute vec2 lightmapUvBake;\nvoid main() {')
+      .replace(
+        '#include <fog_vertex>',
+        // NOTE The atlas UV in the layout of this bake. Meshes without a place (UV -10) are outside the clip space
+        '#include <fog_vertex>\ngl_Position = vec4( lightmapUvBake * 2.0 - 1.0, 0.0, 1.0 );',
+      );
 
     // NOTE The winding in lightmap space is arbitrary (xatlas mirrors some charts), keep the geometric normal.
     // onBeforeCompile sees the #include lines, so the chunk is replaced as a whole.
@@ -156,20 +160,19 @@ export async function createBakedLightmap(ctx) {
 
   const settings = {
     atlasSize: 1024,
-    samplesPerFrame: 64,
-    samplesPerBake: 1000,
-    fadeTime: 0.25,
+    samplesPerFrame: 12,
+    samplesPerBake: 512,
+    fadeTime: 0.35,
     mapSize: 512,
     specularOcclusion: true,
-    shadowNoise: 2,
-    directionJitter: 0,
-    shadowBlur: 2,
+    shadowNoise: 8,
+    directionJitter: 2,
+    frustumAtlas: true,
+    frustumMargin: 20,
     debug: 'off',
   };
 
-  const unwrapStart = performance.now();
-  await createLightmapLayout(ctx.meshes, settings.atlasSize);
-  const unwrapMs = performance.now() - unwrapStart;
+  await createLightmapLayout(ctx.meshes);
 
   // NOTE Bake scene: proxies share the geometry, their transforms are a snapshot taken at bake start
   const bakeScene = new THREE.Scene();
@@ -194,7 +197,6 @@ export async function createBakedLightmap(ctx) {
 
   const light = new THREE.DirectionalLight(0xffffff, 1);
   light.castShadow = true;
-  light.shadow.radius = settings.shadowBlur;
   light.shadow.mapSize.setScalar(settings.mapSize);
 
   const jitterAxis = new THREE.Vector3();
@@ -256,6 +258,30 @@ export async function createBakedLightmap(ctx) {
     uniforms: { uMap: { value: null }, uViewport: { value: new THREE.Vector2() } },
   });
 
+  // NOTE Corner preview of the front lightmap, empty texels (no mesh) in dark grey
+  const previewMaterial = new THREE.ShaderMaterial({
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4( position.xy, 0.0, 1.0 );
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D uMap;
+      varying vec2 vUv;
+      void main() {
+        vec4 texel = texture2D( uMap, vUv );
+        vec3 c = texel.rgb / 3.14159265;
+        vec3 color = pow( c / ( 1.0 + c ), vec3( 1.0 / 2.2 ) );
+        gl_FragColor = vec4( texel.a > 0.0 ? color : vec3( 0.12 ), 1.0 );
+      }
+    `,
+    uniforms: { uMap: { value: null } },
+    depthTest: false,
+    depthWrite: false,
+  });
+
   const quad = new FullScreenQuad(finalizeMaterial);
 
   // NOTE Blending into 32-bit float targets needs EXT_float_blend, three.js does not enable it
@@ -284,14 +310,69 @@ export async function createBakedLightmap(ctx) {
   let hasFront = false;
   let count = 0;
   let bakeSamples = settings.samplesPerBake;
-  let bakeStart = 0;
-  let lastBakeMs = 0;
-  let swaps = 0;
   let fade = 1;
-  let shadowMapsThisFrame = 0;
+
+  // NOTE Layouts (per mesh atlas UVs or null): the latest packed one, the one of the bake in progress and
+  // the one of the front lightmap. Keys name the visible set and atlas size a layout was packed for.
+  const packer = createPacker(ctx.meshes);
+  let layout = null;
+  let layoutKey = null;
+  let layoutPending = false;
+  let bakeKey = null;
+  let bakeLayout = ctx.meshes.map(() => null);
+  let frontLayout = ctx.meshes.map(() => null);
+  let visible = ctx.meshes.map(() => true);
+  let visibleKey = '';
+
+  const frustum = new THREE.Frustum();
+  const projectionScreen = new THREE.Matrix4();
+  const sphere = new THREE.Sphere();
+
+  // NOTE Meshes inside the camera frustum (bounding sphere grown by the margin) get a place in the atlas
+  const updateVisible = () => {
+    const camera = ctx.camera;
+
+    camera.updateMatrixWorld();
+    projectionScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projectionScreen);
+
+    visible = ctx.meshes.map((mesh) => {
+      if (!settings.frustumAtlas) return true;
+
+      sphere.copy(mesh.geometry.boundingSphere).applyMatrix4(mesh.matrixWorld);
+      sphere.radius *= 1 + settings.frustumMargin / 100;
+
+      return frustum.intersectsSphere(sphere);
+    });
+
+    visibleKey = `${visible.map((v) => (v ? '1' : '0')).join('')}|${settings.atlasSize}`;
+  };
+
+  // NOTE Packing runs in a worker, the bake starts when the layout is back
+  const requestLayout = () => {
+    const key = visibleKey;
+
+    layoutPending = true;
+
+    packer.pack(visible.slice(), settings.atlasSize).then((result) => {
+      layout = result;
+      layoutKey = key;
+      layoutPending = false;
+    });
+  };
 
   const startBake = () => {
     for (let i = 0; i < proxies.length; i++) proxies[i].matrixWorld.copy(ctx.meshes[i].matrixWorld);
+
+    bakeLayout = layout;
+    bakeKey = layoutKey;
+    setLayout(ctx.meshes, 'lightmapUvBake', bakeLayout);
+
+    // NOTE The first bake is on screen while it converges, so the front uses its layout
+    if (!hasFront) {
+      frontLayout = bakeLayout;
+      setLayout(ctx.meshes, 'lightmapUvFront', frontLayout);
+    }
 
     const previous = renderer.getRenderTarget();
     renderer.setRenderTarget(sumTarget);
@@ -304,7 +385,6 @@ export async function createBakedLightmap(ctx) {
     bakeSamples = Math.max(1, settings.samplesPerBake);
     baking = true;
     dirty = false;
-    bakeStart = performance.now();
   };
 
   const finalize = (output) => {
@@ -335,7 +415,6 @@ export async function createBakedLightmap(ctx) {
       jitterUniforms.bakeSeed.value = sequence % 4096;
       jitterUniforms.bakeNoise.value = settings.shadowNoise;
       jitterUniforms.bakeMapTexel.value = 1 / settings.mapSize;
-      light.shadow.radius = settings.shadowBlur;
 
       light.position.copy(direction).multiplyScalar(2 * radius).add(center);
       target.position.copy(center);
@@ -358,7 +437,6 @@ export async function createBakedLightmap(ctx) {
     }
 
     renderer.autoClear = autoClear;
-    shadowMapsThisFrame = amount;
   };
 
   const rebuildTargets = () => {
@@ -375,6 +453,8 @@ export async function createBakedLightmap(ctx) {
     hookUniforms.lmValid.value = 0;
     baking = false;
     dirty = true;
+    bakeKey = null;
+    setLayout(ctx.meshes, 'lightmapUvPrevious', ctx.meshes.map(() => null));
   };
 
   return {
@@ -382,14 +462,22 @@ export async function createBakedLightmap(ctx) {
       key: 'baked-lightmap',
       uniforms: hookUniforms,
       vertexPars: /* glsl */ `
-        attribute vec2 lightmapUv;
-        varying vec2 vLightmapUv;
+        attribute vec2 lightmapUvFront;
+        attribute vec2 lightmapUvPrevious;
+        varying vec2 vLmFront;
+        varying vec2 vLmPrevious;
+        varying vec2 vLmHas;
       `,
       vertex: /* glsl */ `
-        vLightmapUv = lightmapUv;
+        // NOTE Each lightmap is read with the layout it was baked with
+        vLmFront = lightmapUvFront;
+        vLmPrevious = lightmapUvPrevious;
+        vLmHas = vec2( step( 0.0, lightmapUvFront.x ), step( 0.0, lightmapUvPrevious.x ) );
       `,
       pars: /* glsl */ `
-        varying vec2 vLightmapUv;
+        varying vec2 vLmFront;
+        varying vec2 vLmPrevious;
+        varying vec2 vLmHas;
         uniform sampler2D lmFront;
         uniform sampler2D lmPrevious;
         uniform float lmBlend;
@@ -404,7 +492,10 @@ export async function createBakedLightmap(ctx) {
       `,
       diffuse: /* glsl */ `
         vec3 lmUnoccluded = getIBLIrradiance( geometryNormal );
-        vec3 lmBaked = mix( texture2D( lmPrevious, vLightmapUv ).rgb, texture2D( lmFront, vLightmapUv ).rgb, lmBlend );
+        // NOTE A mesh without a place in a lightmap (it was outside the frustum) uses the unoccluded light
+        vec3 lmFrontValue = vLmHas.x > 0.5 ? texture2D( lmFront, vLmFront ).rgb : lmUnoccluded;
+        vec3 lmPreviousValue = vLmHas.y > 0.5 ? texture2D( lmPrevious, vLmPrevious ).rgb : lmUnoccluded;
+        vec3 lmBaked = mix( lmPreviousValue, lmFrontValue, lmBlend );
         vec3 lmIrradiance = lmValid > 0.5 ? lmBaked : lmUnoccluded;
 
         lmVisibility = clamp( lmLuminance( lmIrradiance ) / max( 1e-6, lmLuminance( lmUnoccluded ) ), 0.0, 1.0 );
@@ -422,13 +513,18 @@ export async function createBakedLightmap(ctx) {
     },
 
     beforeRender(frame) {
-      shadowMapsThisFrame = 0;
-
       if (!sample) return;
 
       if (frame.sceneChanged) dirty = true;
 
-      if (!baking && dirty) startBake();
+      // NOTE A different visible set needs a new layout, camera moves inside the same set cost nothing
+      updateVisible();
+
+      if (visibleKey !== layoutKey && !layoutPending) requestLayout();
+
+      if (layoutKey !== bakeKey) dirty = true;
+
+      if (!baking && dirty && layout) startBake();
 
       const previousTarget = renderer.getRenderTarget();
       const clearColor = renderer.getClearColor(new THREE.Color());
@@ -446,14 +542,18 @@ export async function createBakedLightmap(ctx) {
 
         if (count >= bakeSamples) {
           baking = false;
-          lastBakeMs = performance.now() - bakeStart;
 
           if (hasFront) {
             // NOTE Finish into the previous slot, then swap: the new lightmap fades in over the old one
             finalize(lightmaps[1]);
             lightmaps.reverse();
             fade = 0;
-            swaps++;
+
+            // NOTE The layouts swap with the lightmaps
+            setLayout(ctx.meshes, 'lightmapUvPrevious', frontLayout);
+            frontLayout = bakeLayout;
+            setLayout(ctx.meshes, 'lightmapUvFront', frontLayout);
+            hookUniforms.lmBlend.value = 0;
           } else {
             hasFront = true;
             fade = 1;
@@ -488,6 +588,26 @@ export async function createBakedLightmap(ctx) {
       return true;
     },
 
+    // NOTE Draws the front lightmap into a square at the bottom left of the canvas, in CSS pixels
+    renderPreview(x, y, size) {
+      const viewport = renderer.getViewport(new THREE.Vector4());
+      const scissor = renderer.getScissor(new THREE.Vector4());
+      const scissorTest = renderer.getScissorTest();
+
+      previewMaterial.uniforms.uMap.value = lightmaps[0].texture;
+      quad.material = previewMaterial;
+
+      renderer.setRenderTarget(null);
+      renderer.setViewport(x, y, size, size);
+      renderer.setScissor(x, y, size, size);
+      renderer.setScissorTest(true);
+      quad.render(renderer);
+
+      renderer.setViewport(viewport);
+      renderer.setScissor(scissor);
+      renderer.setScissorTest(scissorTest);
+    },
+
     gui(folder) {
       folder.add(settings, 'samplesPerFrame', 0, 1000, 1).name('shadow maps / frame (bake)');
       folder.add(settings, 'samplesPerBake', 0, 1000, 1).name('samples / bake').onChange(() => (dirty = true));
@@ -504,29 +624,11 @@ export async function createBakedLightmap(ctx) {
         });
       folder.add(settings, 'shadowNoise', 0, 1000, 0.1).name('shadow noise (texels)').onChange(() => (dirty = true));
       folder.add(settings, 'directionJitter', 0, 1000, 0.1).name('direction jitter (deg)').onChange(() => (dirty = true));
-      folder.add(settings, 'shadowBlur', 0, 1000, 0.1).name('shadow blur (PCF radius)').onChange(() => (dirty = true));
+      folder.add(settings, 'frustumAtlas').name('atlas: only meshes in view');
+      folder.add(settings, 'frustumMargin', 0, 1000, 1).name('view margin (%)');
       folder.add(settings, 'specularOcclusion').name('specular occlusion');
       folder.add(settings, 'debug', ['off', 'atlas']).name('debug view');
       folder.add({ rebake: () => (dirty = true) }, 'rebake').name('rebake now');
-    },
-
-    stats() {
-      const state = baking
-        ? `${hasFront ? 'background bake' : 'first bake'} ${count}/${bakeSamples}`
-        : dirty
-          ? 'queued'
-          : 'idle (0 shadow maps / frame)';
-
-      return (
-        `${state} · ${shadowMapsThisFrame} shadow maps this frame · camera moves never rebake\n` +
-        `last bake ${lastBakeMs.toFixed(0)} ms · swaps ${swaps} · atlas ${settings.atlasSize}² · unwrap ${unwrapMs.toFixed(0)} ms`
-      );
-    },
-
-    memory() {
-      const texels = settings.atlasSize * settings.atlasSize;
-
-      return texels * 16 + texels * 8 * 2 + settings.mapSize * settings.mapSize * 4;
     },
 
     dispose() {
@@ -535,6 +637,8 @@ export async function createBakedLightmap(ctx) {
       bakeMaterial.dispose();
       finalizeMaterial.dispose();
       debugMaterial.dispose();
+      previewMaterial.dispose();
+      packer.dispose();
       quad.dispose();
       light.dispose();
     },

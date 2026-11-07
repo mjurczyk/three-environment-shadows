@@ -1,13 +1,16 @@
 import * as THREE from 'three';
 import XAtlas from 'xatlas-web';
 import wasmUrl from 'xatlas-web/dist/xatlas-web.wasm?url';
+import { NO_PLACE, packCharts } from './atlasPacker.js';
 
 /**
- * Gives every mesh a `lightmapUv` attribute with a unique place in one shared atlas.
+ * Lightmap atlas layouts, packed per chart.
  *
- * Each mesh is unwrapped on its own with xatlas (charts packed into 0..1), then the per-mesh squares
- * are packed into the atlas with a size proportional to the surface area of the mesh. The meshes get
- * new geometries (xatlas splits vertices at seams), positions, normals and uvs do not change.
+ * Each mesh is unwrapped once with xatlas. The result is split into charts (connected UV islands),
+ * each turned to its smallest bounding rect. A layout packs the charts of the selected meshes into the
+ * atlas (see atlasPacker.js), in a worker. A layout is a per-vertex UV, so the geometry is shared
+ * between layouts. The meshes get new geometries (xatlas splits vertices at seams), positions, normals
+ * and uvs do not change.
  */
 
 let modulePromise = null;
@@ -20,32 +23,6 @@ const loadXAtlas = () => {
 
   return modulePromise;
 };
-
-function surfaceArea(geometry, matrix) {
-  const position = geometry.attributes.position;
-  const index = geometry.index;
-  const a = new THREE.Vector3();
-  const b = new THREE.Vector3();
-  const c = new THREE.Vector3();
-  const triangle = new THREE.Triangle();
-  const count = index ? index.count : position.count;
-
-  let area = 0;
-
-  for (let i = 0; i < count; i += 3) {
-    const i0 = index ? index.getX(i) : i;
-    const i1 = index ? index.getX(i + 1) : i + 1;
-    const i2 = index ? index.getX(i + 2) : i + 2;
-
-    a.fromBufferAttribute(position, i0).applyMatrix4(matrix);
-    b.fromBufferAttribute(position, i1).applyMatrix4(matrix);
-    c.fromBufferAttribute(position, i2).applyMatrix4(matrix);
-
-    area += triangle.set(a, b, c).getArea();
-  }
-
-  return area;
-}
 
 // NOTE Unwraps one geometry, returns a new geometry with `lightmapUv` in 0..1
 function unwrap(xatlas, source) {
@@ -127,77 +104,246 @@ function unwrap(xatlas, source) {
   return result;
 }
 
-// NOTE Shelf packing of squares into the unit square, returns { x, y, size } per item or null if it does not fit
-function pack(sides, padding) {
-  const order = sides.map((side, i) => i).sort((a, b) => sides[b] - sides[a]);
-  const rects = new Array(sides.length);
+// NOTE The atlas UV of a mesh per layout, x < 0 when the mesh has no place in that layout
+export const UV_ATTRIBUTES = ['lightmapUvBake', 'lightmapUvFront', 'lightmapUvPrevious'];
 
-  let x = padding;
-  let y = padding;
-  let shelf = 0;
 
-  for (const i of order) {
-    const side = sides[i];
+// NOTE Splits the unwrapped geometry into charts: triangles that share vertices (xatlas splits vertices at chart seams)
+function findCharts(geometry, matrix) {
+  const index = geometry.index.array;
+  const position = geometry.attributes.position;
+  const uv = geometry.attributes.lightmapUv;
+  const vertexCount = position.count;
 
-    if (x + side + padding > 1) {
-      x = padding;
-      y += shelf + padding;
-      shelf = 0;
-    }
+  const parent = new Int32Array(vertexCount).map((v, i) => i);
+  const find = (i) => {
+    while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+    return i;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  };
 
-    if (y + side + padding > 1) return null;
-
-    rects[i] = { x, y, size: side };
-    x += side + padding;
-    shelf = Math.max(shelf, side);
+  for (let t = 0; t < index.length; t += 3) {
+    union(index[t], index[t + 1]);
+    union(index[t], index[t + 2]);
   }
 
-  return rects;
+  const charts = new Map();
+  const a = new THREE.Vector3();
+  const b = new THREE.Vector3();
+  const c = new THREE.Vector3();
+  const triangle = new THREE.Triangle();
+
+  const getChart = (root) => {
+    let chart = charts.get(root);
+
+    if (!chart) {
+      chart = { vertices: [], triangles: [], worldArea: 0, uvArea: 0 };
+      charts.set(root, chart);
+    }
+
+    return chart;
+  };
+
+  for (let v = 0; v < vertexCount; v++) {
+    getChart(find(v)).vertices.push(v);
+  }
+
+  for (let t = 0; t < index.length; t += 3) {
+    const i0 = index[t];
+    const i1 = index[t + 1];
+    const i2 = index[t + 2];
+    const chart = charts.get(find(i0));
+
+    chart.triangles.push(i0, i1, i2);
+
+    a.fromBufferAttribute(position, i0).applyMatrix4(matrix);
+    b.fromBufferAttribute(position, i1).applyMatrix4(matrix);
+    c.fromBufferAttribute(position, i2).applyMatrix4(matrix);
+    chart.worldArea += triangle.set(a, b, c).getArea();
+
+    const du1 = uv.getX(i1) - uv.getX(i0);
+    const dv1 = uv.getY(i1) - uv.getY(i0);
+    const du2 = uv.getX(i2) - uv.getX(i0);
+    const dv2 = uv.getY(i2) - uv.getY(i0);
+    chart.uvArea += Math.abs(du1 * dv2 - du2 * dv1) / 2;
+  }
+
+  // NOTE Each chart is turned to its smallest bounding rect, its size in meters: one density (texels per meter)
+  // gives every chart the same texel size
+  return [...charts.values()].map((chart) => {
+    const vertices = Uint32Array.from(chart.vertices);
+    const metersPerUv = chart.uvArea > 1e-12 ? Math.sqrt(chart.worldArea / chart.uvArea) : 0;
+    const { cos, sin, minU, minV, maxU, maxV } = smallestRect(vertices, uv);
+
+    return {
+      vertices,
+      triangles: Uint32Array.from(chart.triangles),
+      worldArea: chart.worldArea,
+      metersPerUv,
+      cos,
+      sin,
+      minU,
+      minV,
+      width: (maxU - minU) * metersPerUv,
+      height: (maxV - minV) * metersPerUv,
+    };
+  });
+}
+
+// NOTE Convex hull (monotone chain) of 2D points [ [ x, y ], ... ]
+function convexHull(points) {
+  const sorted = points.slice().sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [];
+  const upper = [];
+
+  for (const p of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const p = sorted[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+
+  upper.pop();
+  lower.pop();
+
+  return lower.concat(upper);
+}
+
+// NOTE The rotation with the smallest bounding rect has one side along a hull edge (rotating calipers)
+function smallestRect(vertices, uv) {
+  const points = Array.from(vertices, (v) => [uv.getX(v), uv.getY(v)]);
+  const hull = points.length > 2 ? convexHull(points) : points;
+
+  let best = null;
+
+  const tryAngle = (cos, sin) => {
+    let minU = Infinity;
+    let minV = Infinity;
+    let maxU = -Infinity;
+    let maxV = -Infinity;
+
+    for (const [x, y] of hull) {
+      const u = cos * x + sin * y;
+      const w = -sin * x + cos * y;
+      minU = Math.min(minU, u);
+      minV = Math.min(minV, w);
+      maxU = Math.max(maxU, u);
+      maxV = Math.max(maxV, w);
+    }
+
+    const area = (maxU - minU) * (maxV - minV);
+
+    if (!best || area < best.area - 1e-12) best = { cos, sin, minU, minV, maxU, maxV, area };
+  };
+
+  tryAngle(1, 0);
+
+  for (let i = 0; i < hull.length; i++) {
+    const [x0, y0] = hull[i];
+    const [x1, y1] = hull[(i + 1) % hull.length];
+    const length = Math.hypot(x1 - x0, y1 - y0);
+
+    if (length > 1e-12) tryAngle((x1 - x0) / length, (y1 - y0) / length);
+  }
+
+  return best;
 }
 
 /**
- * Unwraps the meshes once (cached on the meshes), returns { meshes, rects }.
+ * Unwraps the meshes once (cached on the meshes). Each mesh gets `lightmapUv` (xatlas charts in 0..1),
+ * the layout attributes (see UV_ATTRIBUTES) and `userData.lightmapCharts`.
  */
-export async function createLightmapLayout(meshes, atlasSize) {
-  if (meshes.every((mesh) => mesh.geometry.attributes.lightmapUv)) return { meshes };
+export async function createLightmapLayout(meshes) {
+  if (meshes.every((mesh) => mesh.userData.lightmapCharts)) return;
 
   const xatlas = await loadXAtlas();
 
-  const areas = meshes.map((mesh) => {
+  for (const mesh of meshes) {
     mesh.updateMatrixWorld();
-    return surfaceArea(mesh.geometry, mesh.matrixWorld);
-  });
 
-  const total = areas.reduce((sum, area) => sum + area, 0);
-  const padding = 4 / atlasSize;
-
-  // NOTE Shrink until all squares fit
-  let scale = 1;
-  let rects = null;
-
-  while (rects === null && scale > 0.05) {
-    rects = pack(
-      areas.map((area) => Math.sqrt(area / total) * scale),
-      padding,
-    );
-    scale *= 0.95;
-  }
-
-  meshes.forEach((mesh, i) => {
     const geometry = unwrap(xatlas, mesh.geometry);
-    const uv = geometry.attributes.lightmapUv;
-    const { x, y, size } = rects[i];
+    const count = geometry.attributes.position.count;
 
-    // NOTE Keep a texel of margin inside each square
-    const inner = Math.max(size - 2 * padding, size * 0.5);
-
-    for (let k = 0; k < uv.count; k++) {
-      uv.setXY(k, x + padding + uv.getX(k) * inner, y + padding + uv.getY(k) * inner);
+    for (const name of UV_ATTRIBUTES) {
+      geometry.setAttribute(name, new THREE.BufferAttribute(new Float32Array(count * 2).fill(NO_PLACE), 2));
     }
+
+    geometry.computeBoundingSphere();
+
+    mesh.userData.lightmapCharts = findCharts(geometry, mesh.matrixWorld);
 
     mesh.geometry.dispose();
     mesh.geometry = geometry;
-  });
+  }
+}
 
-  return { meshes, rects };
+/** Writes a layout into one of the UV attributes of every mesh. */
+export function setLayout(meshes, name, layout) {
+  meshes.forEach((mesh, i) => {
+    const attribute = mesh.geometry.attributes[name];
+
+    if (layout[i]) attribute.array.set(layout[i]);
+    else attribute.array.fill(NO_PLACE);
+
+    attribute.needsUpdate = true;
+  });
+}
+
+/**
+ * Packs layouts in a worker, so the main thread does not stop (a pack takes ~100 ms).
+ * pack( visible, atlasSize ) resolves with one Float32Array (atlas UVs) or null per mesh.
+ */
+export function createPacker(meshes) {
+  const meshData = meshes.map((mesh) => ({
+    charts: mesh.userData.lightmapCharts,
+    uv: mesh.geometry.attributes.lightmapUv.array.slice(),
+    vertexCount: mesh.geometry.attributes.position.count,
+  }));
+
+  let worker = null;
+
+  try {
+    worker = new Worker(new URL('./layoutWorker.js', import.meta.url), { type: 'module' });
+    worker.postMessage({ type: 'init', meshData });
+  } catch (error) {
+    console.warn('lightmapLayout: no worker, packing on the main thread', error);
+  }
+
+  const pending = new Map();
+  let nextId = 0;
+
+  if (worker) {
+    worker.onmessage = (event) => {
+      const { id, layout } = event.data;
+      pending.get(id)?.(layout);
+      pending.delete(id);
+    };
+  }
+
+  return {
+    pack(visible, atlasSize) {
+      if (!worker) return Promise.resolve(packCharts(meshData, visible, atlasSize));
+
+      const id = nextId++;
+
+      return new Promise((resolve) => {
+        pending.set(id, resolve);
+        worker.postMessage({ type: 'pack', id, visible, atlasSize });
+      });
+    },
+
+    dispose() {
+      worker?.terminate();
+      pending.clear();
+    },
+  };
 }
