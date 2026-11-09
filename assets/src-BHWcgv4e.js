@@ -1,4 +1,4 @@
-import{t as e}from"./EnvironmentShadowsBase-bvALgVDm.js";import{A as t,F as n,Gn as r,_t as i,at as a,c as o,j as s,rt as c,t as l,wn as u}from"./index-wwF1ajs9.js";var d=`float faceDirection = gl_FrontFacing ? 1.0 : - 1.0;`,f=`vDirectionalShadowCoord[ i ]`,p=`
+import{t as e}from"./EnvironmentShadowsBase-BJ8WCBaw.js";import{A as t,F as n,Gn as r,_t as i,at as a,c as o,j as s,rt as c,t as l,wn as u}from"./index-DiHewnsw.js";var d=`float faceDirection = gl_FrontFacing ? 1.0 : - 1.0;`,f=`vDirectionalShadowCoord[ i ]`,p=`
   uniform float bakeNoise; // in shadow map texels
   uniform float bakeSeed; // changes every sample
   uniform float bakeMapTexel; // 1 / shadow map size
@@ -72,8 +72,17 @@ import{t as e}from"./EnvironmentShadowsBase-bvALgVDm.js";import{A as t,F as n,Gn
 `,v=`
   {
     vec3 lmUnoccluded = iblIrradiance;
-    vec3 lmValueA = vLmHas.x > 0.5 ? texture2D( lmA, vLmA ).rgb : lmUnoccluded;
-    vec3 lmValueB = vLmHas.y > 0.5 ? texture2D( lmB, vLmB ).rgb : lmUnoccluded;
+
+    // NOTE The lightmap is baked at intensity 1. envMapIntensity is material.envMapIntensity or
+    // scene.environmentIntensity, the same as for the environment diffuse. The unoccluded light has it already.
+    #ifdef USE_ENVMAP
+      float lmIntensity = envMapIntensity;
+    #else
+      float lmIntensity = 1.0;
+    #endif
+
+    vec3 lmValueA = vLmHas.x > 0.5 ? texture2D( lmA, vLmA ).rgb * lmIntensity : lmUnoccluded;
+    vec3 lmValueB = vLmHas.y > 0.5 ? texture2D( lmB, vLmB ).rgb * lmIntensity : lmUnoccluded;
     vec3 lmFront = lmFrontIsA > 0.5 ? lmValueA : lmValueB;
     vec3 lmPrevious = lmFrontIsA > 0.5 ? lmValueB : lmValueA;
     vec3 lmIrradiance = lmValid > 0.5 ? mix( lmPrevious, lmFront, lmBlend ) : lmUnoccluded;
