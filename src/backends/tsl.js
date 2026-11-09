@@ -26,6 +26,7 @@ import {
   modelNormalMatrix,
   normalLocal,
   positionWorld,
+  reference,
   renderGroup,
   screenCoordinate,
   select,
@@ -61,9 +62,23 @@ class EnvironmentShadowsLightingNode extends LightingNode {
 
     const unoccluded = vec3(iblIrradiance).toVar();
 
+    // NOTE The lightmap is baked at intensity 1. Same intensity as the environment node: material.envMapIntensity
+    // with material.envMap, else scene.environmentIntensity. The unoccluded light has it already.
+    const intensity = builder.material.envMap
+      ? reference('envMapIntensity', 'float', builder.material)
+      : reference('environmentIntensity', 'float', builder.scene);
+
     // NOTE Atlas UVs are > 0, meshes without a place (UV -10) keep the unoccluded light
-    const valueA = select(display.uvA.x.greaterThan(1e-6), display.sampleA.rgb, unoccluded);
-    const valueB = select(display.uvB.x.greaterThan(1e-6), display.sampleB.rgb, unoccluded);
+    const valueA = select(
+      display.uvA.x.greaterThan(1e-6),
+      display.sampleA.rgb.mul(intensity),
+      unoccluded,
+    );
+    const valueB = select(
+      display.uvB.x.greaterThan(1e-6),
+      display.sampleB.rgb.mul(intensity),
+      unoccluded,
+    );
     const frontIsA = display.frontIsA.greaterThan(0.5);
     const front = select(frontIsA, valueA, valueB);
     const previous = select(frontIsA, valueB, valueA);

@@ -114,8 +114,17 @@ const DISPLAY_FRAGMENT_PARS = /* glsl */ `
 const DISPLAY_FRAGMENT = /* glsl */ `
   {
     vec3 lmUnoccluded = iblIrradiance;
-    vec3 lmValueA = vLmHas.x > 0.5 ? texture2D( lmA, vLmA ).rgb : lmUnoccluded;
-    vec3 lmValueB = vLmHas.y > 0.5 ? texture2D( lmB, vLmB ).rgb : lmUnoccluded;
+
+    // NOTE The lightmap is baked at intensity 1. envMapIntensity is material.envMapIntensity or
+    // scene.environmentIntensity, the same as for the environment diffuse. The unoccluded light has it already.
+    #ifdef USE_ENVMAP
+      float lmIntensity = envMapIntensity;
+    #else
+      float lmIntensity = 1.0;
+    #endif
+
+    vec3 lmValueA = vLmHas.x > 0.5 ? texture2D( lmA, vLmA ).rgb * lmIntensity : lmUnoccluded;
+    vec3 lmValueB = vLmHas.y > 0.5 ? texture2D( lmB, vLmB ).rgb * lmIntensity : lmUnoccluded;
     vec3 lmFront = lmFrontIsA > 0.5 ? lmValueA : lmValueB;
     vec3 lmPrevious = lmFrontIsA > 0.5 ? lmValueB : lmValueA;
     vec3 lmIrradiance = lmValid > 0.5 ? mix( lmPrevious, lmFront, lmBlend ) : lmUnoccluded;
