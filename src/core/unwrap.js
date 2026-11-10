@@ -192,6 +192,13 @@ function unwrapModule() {
       chart.uvArea += Math.abs(du1 * dv2 - du2 * dv1) / 2;
     }
 
+    // NOTE xatlas can return charts without UV area. They get a planar projection of their world positions.
+    for (const chart of charts.values()) {
+      if (chart.uvArea > 1e-12 || chart.worldArea <= 0) continue;
+
+      projectChart(chart, world, uv, a, b, c);
+    }
+
     // NOTE Each chart is turned to its smallest bounding rect, its size in meters: one density (texels per meter)
     // gives every chart the same texel size
     return [...charts.values()].map((chart) => {
@@ -212,6 +219,74 @@ function unwrapModule() {
         height: (maxV - minV) * metersPerUv,
       };
     });
+  }
+
+  // NOTE Projects the chart onto the plane of its largest triangle, sets its uvArea
+  function projectChart(chart, world, uv, a, b, c) {
+    const { triangles } = chart;
+    const normal = [0, 0, 1];
+    let largest = -1;
+
+    for (let t = 0; t < triangles.length; t += 3) {
+      world(triangles[t], a);
+      world(triangles[t + 1], b);
+      world(triangles[t + 2], c);
+
+      const ux = b[0] - a[0];
+      const uy = b[1] - a[1];
+      const uz = b[2] - a[2];
+      const vx = c[0] - a[0];
+      const vy = c[1] - a[1];
+      const vz = c[2] - a[2];
+      const nx = uy * vz - uz * vy;
+      const ny = uz * vx - ux * vz;
+      const nz = ux * vy - uy * vx;
+      const length = Math.hypot(nx, ny, nz);
+
+      if (length > largest) {
+        largest = length;
+        normal[0] = nx / length;
+        normal[1] = ny / length;
+        normal[2] = nz / length;
+      }
+    }
+
+    // NOTE Tangent and bitangent of the plane
+    const helper = Math.abs(normal[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+    const tangent = [
+      helper[1] * normal[2] - helper[2] * normal[1],
+      helper[2] * normal[0] - helper[0] * normal[2],
+      helper[0] * normal[1] - helper[1] * normal[0],
+    ];
+    const tangentLength = Math.hypot(...tangent);
+
+    for (let k = 0; k < 3; k++) tangent[k] /= tangentLength;
+
+    const bitangent = [
+      normal[1] * tangent[2] - normal[2] * tangent[1],
+      normal[2] * tangent[0] - normal[0] * tangent[2],
+      normal[0] * tangent[1] - normal[1] * tangent[0],
+    ];
+
+    for (const v of chart.vertices) {
+      world(v, a);
+      uv[v * 2] = a[0] * tangent[0] + a[1] * tangent[1] + a[2] * tangent[2];
+      uv[v * 2 + 1] = a[0] * bitangent[0] + a[1] * bitangent[1] + a[2] * bitangent[2];
+    }
+
+    chart.uvArea = 0;
+
+    for (let t = 0; t < triangles.length; t += 3) {
+      const i0 = triangles[t];
+      const i1 = triangles[t + 1];
+      const i2 = triangles[t + 2];
+      const du1 = uv[i1 * 2] - uv[i0 * 2];
+      const dv1 = uv[i1 * 2 + 1] - uv[i0 * 2 + 1];
+      const du2 = uv[i2 * 2] - uv[i0 * 2];
+      const dv2 = uv[i2 * 2 + 1] - uv[i0 * 2 + 1];
+
+      chart.uvArea += Math.abs(du1 * dv2 - du2 * dv1) / 2;
+    }
   }
 
   // NOTE Convex hull (monotone chain) of 2D points [ [ x, y ], ... ]

@@ -107,6 +107,8 @@ const DISPLAY_FRAGMENT_PARS = /* glsl */ `
   uniform float lmBlend;
   uniform float lmValid;
   uniform float lmSpecularOcclusion;
+  uniform float lmShadowStart;
+  uniform float lmShadowEnd;
 `;
 
 // NOTE After lights_fragment_maps: iblIrradiance holds the environment diffuse, radiance the environment specular.
@@ -131,6 +133,14 @@ const DISPLAY_FRAGMENT = /* glsl */ `
 
     vec3 lmWeights = vec3( 0.2126, 0.7152, 0.0722 );
     float lmVisibility = clamp( dot( lmIrradiance, lmWeights ) / max( 1e-6, dot( lmUnoccluded, lmWeights ) ), 0.0, 1.0 );
+
+    // NOTE Occlusion remap: no darkening below the start, full darkening at the end.
+    // Scaling the baked light keeps its color and direction.
+    float lmOcclusion = clamp( ( 1.0 - lmVisibility - lmShadowStart ) / max( 1e-4, lmShadowEnd - lmShadowStart ), 0.0, 1.0 );
+    float lmRemapped = 1.0 - lmOcclusion;
+
+    lmIrradiance *= lmRemapped / max( 1e-3, lmVisibility );
+    lmVisibility = lmRemapped;
 
     iblIrradiance = lmIrradiance;
     radiance *= mix( 1.0, lmVisibility, lmSpecularOcclusion );
@@ -260,6 +270,8 @@ export const glslBackend = {
       lmBlend: { value: 1 },
       lmValid: { value: 0 },
       lmSpecularOcclusion: { value: 1 },
+      lmShadowStart: { value: 0 },
+      lmShadowEnd: { value: 1 },
     };
 
     const originals = new WeakMap();
@@ -272,6 +284,8 @@ export const glslBackend = {
         blend: uniforms.lmBlend,
         valid: uniforms.lmValid,
         specularOcclusion: uniforms.lmSpecularOcclusion,
+        shadowStart: uniforms.lmShadowStart,
+        shadowEnd: uniforms.lmShadowEnd,
       },
 
       // NOTE WebGLRenderer uploads material uniforms every frame, new textures need nothing

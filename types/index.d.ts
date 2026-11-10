@@ -24,6 +24,16 @@ export interface EnvironmentShadowsOptions {
   frustumAtlas?: boolean;
   /** Growth of the bounding spheres for the frustum test, in percent. Default 20. */
   frustumMargin?: number;
+  /** Whether the charts seen by the camera (ray test) get more atlas area. Default false. */
+  visibleAtlas?: boolean;
+  /** Width of the ray grid of the visibility test, the height follows the aspect. Default 384. */
+  visibilityResolution?: number;
+  /** Atlas area of the visible charts, times the area of the hidden ones. Default 2. */
+  visibleScale?: number;
+  /** Shadow strength, 0 to 1: higher ignores more of the weak occlusion. Default 0.5. */
+  shadowBalance?: number;
+  /** Whether moved meshes, a new environment or a new layout start a new bake. Default false. */
+  autoUpdate?: boolean;
   /** The area that receives shadows. Default: the bounds of the meshes. */
   bounds?: Sphere;
   /** The meshes. Default: all meshes of the scene that cast or receive shadows. */
@@ -53,6 +63,11 @@ export class EnvironmentShadows {
   specularOcclusion: boolean;
   frustumAtlas: boolean;
   frustumMargin: number;
+  visibleAtlas: boolean;
+  visibilityResolution: number;
+  visibleScale: number;
+  shadowBalance: number;
+  autoUpdate: boolean;
   /** The area that receives shadows, set when {@link ready} resolves if not given. */
   bounds: Sphere | null;
   /** Set to `true` to start a new bake, e.g. after a change of the options. */
