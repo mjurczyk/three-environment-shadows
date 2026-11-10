@@ -25,7 +25,7 @@ const params = {
   environment: search.get('env') ?? 'sky_dusk',
   scene: 'Island Castle',
   view: 'combined',
-  rotate: true,
+  rotate: false,
   atlas: false,
 };
 
