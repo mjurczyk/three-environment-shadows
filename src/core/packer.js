@@ -25,8 +25,8 @@ function packerModule() {
   }
 
   /**
-   * Column outline of a chart on the packing grid: for each column the lowest and highest filled cell,
-   * grown by `pad` cells. `turned` rasterizes with u and v swapped. Cells are `cell` meters.
+   * Column outline of a chart on the packing grid: the lowest and highest filled cell of each column, plus
+   * `pad` cells right and up. `turned` swaps u and v. Cells are `cell` meters.
    */
   function chartOutline(chart, uv, cell, pad, turned) {
     const w = Math.max(1, Math.ceil((turned ? chart.height : chart.width) / cell));
@@ -79,8 +79,8 @@ function packerModule() {
       }
     }
 
-    // NOTE Grow by the padding: wider columns, then lower bottoms and higher tops
-    const width = w + 2 * pad;
+    // NOTE Grow by the padding: columns to the right, then higher tops
+    const width = w + pad;
     const outBottom = new Int32Array(width).fill(1 << 30);
     const outTop = new Int32Array(width).fill(-(1 << 30));
 
@@ -90,9 +90,9 @@ function packerModule() {
       const b = Math.max(0, Math.floor(bottom[c]));
       const tp = Math.min(h, Math.ceil(top[c]));
 
-      for (let d = 0; d <= 2 * pad; d++) {
+      for (let d = 0; d <= pad; d++) {
         outBottom[c + d] = Math.min(outBottom[c + d], b);
-        outTop[c + d] = Math.max(outTop[c + d], tp + 2 * pad);
+        outTop[c + d] = Math.max(outTop[c + d], tp + pad);
       }
     }
 
@@ -104,7 +104,7 @@ function packerModule() {
       }
     }
 
-    return { w: width, h: h + 2 * pad, bottom: outBottom, top: outTop };
+    return { w: width, h: h + pad, bottom: outBottom, top: outTop };
   }
 
   // NOTE Flips an outline vertically (mirror in v)
@@ -142,11 +142,13 @@ function packerModule() {
   /**
    * Outline (Tetris) packing on a grid of `size` columns: a height map of the filled part of each column,
    * every chart rests on it with its own bottom outline, so curved charts nest into each other.
-   * Each chart tries 4 variants (as is, turned, flipped, both). Returns placements or null.
+   * Each chart tries 4 variants (as is, turned, flipped, both). A chart without a place gets null.
+   * All columns start at `start` (the rows below are the shelves of the small charts).
    */
-  function outlinePack(items, size) {
-    const height = new Int32Array(size);
-    const placements = new Array(items.length);
+  function outlinePack(items, size, start = 0) {
+    const height = new Int32Array(size).fill(start);
+    const placements = new Array(items.length).fill(null);
+    let missed = 0;
     const order = items.map((item, i) => i).sort((i, j) => items[j].area - items[i].area);
 
     for (const i of order) {
@@ -194,7 +196,10 @@ function packerModule() {
         }
       }
 
-      if (!best) return null;
+      if (!best) {
+        missed++;
+        continue;
+      }
 
       const { top, columns } = items[i].outlines[best.variant];
 
@@ -203,35 +208,106 @@ function packerModule() {
       placements[i] = best;
     }
 
-    return placements;
+    return { placements, missed };
   }
 
   // NOTE Texels of margin around each chart, against bleeding of bilinear filtering and dilation.
   // Small atlases have large texels, so they get a wider margin.
   const atlasPadding = (atlasSize) => (atlasSize > 512 ? 2 : 4);
 
+  // NOTE Smallest chart area, in texels
+  const MIN_CHART_TEXELS = 1;
+
+  // NOTE Charts with outlines of at most SMALL_CHART x SMALL_CHART cells go into shelves, the outline search is slow
+  const SMALL_CHART = 8;
+
+  /**
+   * Shelf packing of the rects of small charts, rows from the atlas bottom.
+   * Returns the placements (null without a place), the misses and the shelf height.
+   */
+  function shelfPack(items, size) {
+    const placements = new Array(items.length).fill(null);
+    const order = items
+      .map((item, i) => i)
+      .sort((i, j) => items[j].outlines[0].h - items[i].outlines[0].h);
+    let x = 0;
+    let y = 0;
+    let shelf = 0;
+    let missed = 0;
+
+    for (const i of order) {
+      const { w, h } = items[i].outlines[0];
+
+      if (x + w > size) {
+        y += shelf;
+        x = 0;
+        shelf = 0;
+      }
+
+      if (y + h > size) {
+        missed++;
+        continue;
+      }
+
+      placements[i] = { x, y, variant: 0 };
+      x += w;
+      shelf = Math.max(shelf, h);
+    }
+
+    return { placements, missed, height: y + shelf };
+  }
+
   /**
    * Packs the charts of the meshes with visible[ i ] === true into the atlas, at the largest texel density
    * that fits. meshData[ i ] = { charts, uv (Float32Array, xatlas UVs), vertexCount }.
+   * With masks (screen hit counts), the visible charts (hits > 0) get `visibleScale` times more area.
    * Returns per mesh a Float32Array of atlas UVs (2 per vertex), or null without a place.
    */
-  function packCharts(meshData, visible, atlasSize, padding = atlasPadding(atlasSize)) {
+  function packCharts(
+    meshData,
+    visible,
+    atlasSize,
+    padding = atlasPadding(atlasSize),
+    masks = null,
+    visibleScale = 2,
+  ) {
     const charts = [];
 
     meshData.forEach((mesh, meshIndex) => {
       if (!visible[meshIndex]) return;
 
-      for (const chart of mesh.charts) {
-        if (chart.metersPerUv > 0) charts.push({ meshIndex, chart, uv: mesh.uv });
-      }
+      const mask = masks ? masks[meshIndex] : null;
+
+      mesh.charts.forEach((chart, c) => {
+        if (chart.metersPerUv <= 0 || chart.worldArea <= 0) return;
+
+        if (!mask || mask[c] === 0 || visibleScale === 1) {
+          charts.push({ meshIndex, chart, uv: mesh.uv });
+          return;
+        }
+
+        const scale = Math.sqrt(visibleScale);
+
+        charts.push({
+          meshIndex,
+          chart: {
+            ...chart,
+            metersPerUv: chart.metersPerUv * scale,
+            width: chart.width * scale,
+            height: chart.height * scale,
+            worldArea: chart.worldArea * visibleScale,
+          },
+          uv: mesh.uv,
+        });
+      });
     });
 
     const result = meshData.map(() => null);
 
     if (charts.length === 0) return result;
 
-    // NOTE The packing grid: cells of `texelsPerCell` texels
-    const size = Math.min(atlasSize, 512);
+    // NOTE The packing grid: cells of `texelsPerCell` texels, one texel per cell up to 2048
+    const size = Math.min(atlasSize, 2048);
     const texelsPerCell = atlasSize / size;
     const pad = Math.max(1, Math.ceil(padding / texelsPerCell));
 
@@ -240,18 +316,49 @@ function packerModule() {
       const cell = texelsPerCell / density;
 
       const items = charts.map(({ chart, uv }) => {
-        const plain = chartOutline(chart, uv, cell, pad, false);
-        const turned = chartOutline(chart, uv, cell, pad, true);
+        // NOTE Small charts grow to MIN_CHART_TEXELS, else their triangles cover no texel center and stay black
+        const texels = chart.width * chart.height * density * density;
+        const chartCell = cell / Math.max(1, Math.sqrt(MIN_CHART_TEXELS / Math.max(texels, 1e-12)));
+
+        // NOTE Small charts only need their rect (the size of their plain outline), no rasterization
+        const w = Math.max(1, Math.ceil(chart.width / chartCell)) + pad;
+        const h = Math.max(1, Math.ceil(chart.height / chartCell)) + pad;
+
+        if (w <= SMALL_CHART && h <= SMALL_CHART)
+          return { area: chart.worldArea, cell: chartCell, small: true, outlines: [{ w, h }] };
+
+        const plain = chartOutline(chart, uv, chartCell, pad, false);
+        const turned = chartOutline(chart, uv, chartCell, pad, true);
 
         return {
           area: chart.worldArea,
+          cell: chartCell,
           outlines: [plain, turned, flipOutline(plain), flipOutline(turned)].map(prepareOutline),
         };
       });
 
-      const placements = outlinePack(items, size);
+      // NOTE Small charts in shelves at the bottom, the others by their outlines above them
+      const small = [];
+      const large = [];
 
-      return placements ? { placements, items, cell } : null;
+      items.forEach((item, i) => (item.small ? small : large).push(i));
+
+      // NOTE The first `pad` columns stay empty: the display reads an atlas u of 0 as no place
+      const shelves = shelfPack(
+        small.map((i) => items[i]),
+        size - pad,
+      );
+      const outlines = outlinePack(
+        large.map((i) => items[i]),
+        size - pad,
+        shelves.height,
+      );
+      const placements = new Array(items.length).fill(null);
+
+      small.forEach((i, k) => (placements[i] = shelves.placements[k]));
+      large.forEach((i, k) => (placements[i] = outlines.placements[k]));
+
+      return { placements, missed: shelves.missed + outlines.missed, items, cell };
     };
 
     // NOTE Binary search for the largest density that fits, around the density that fills the atlas
@@ -261,20 +368,35 @@ function packerModule() {
     let low = 0.25 * full;
     let high = full;
     let best = tryDensity(low);
+    // NOTE If not all charts fit, keep the result with the fewest charts without a place
+    let partial = best;
 
-    for (let step = 0; step < 7; step++) {
-      const density = (low + high) / 2;
-      const packed = tryDensity(density);
-
-      if (packed) {
-        low = density;
-        best = packed;
-      } else {
-        high = density;
-      }
+    // NOTE Lower densities until all charts fit, or give up and use the partial result
+    for (let step = 0; step < 8 && best.missed > 0; step++) {
+      high = low;
+      low *= 0.5;
+      best = tryDensity(low);
+      if (best.missed < partial.missed) partial = best;
     }
 
-    if (!best) return result;
+    if (best.missed === 0) {
+      for (let step = 0; step < 5; step++) {
+        const density = (low + high) / 2;
+        const packed = tryDensity(density);
+
+        if (packed.missed === 0) {
+          low = density;
+          best = packed;
+        } else {
+          high = density;
+        }
+      }
+    } else {
+      best = partial;
+      console.warn(
+        `EnvironmentShadows: ${best.missed} of ${charts.length} charts have no place in the atlas.`,
+      );
+    }
 
     meshData.forEach((mesh, meshIndex) => {
       if (visible[meshIndex])
@@ -284,6 +406,8 @@ function packerModule() {
     const point = [0, 0];
 
     charts.forEach(({ meshIndex, chart, uv }, i) => {
+      if (!best.placements[i]) return;
+
       const uvs = result[meshIndex];
       const { x, y, variant } = best.placements[i];
       const { h } = best.items[i].outlines[variant];
@@ -294,15 +418,14 @@ function packerModule() {
         chartPoint(chart, uv, v, point);
 
         // NOTE In cells. Turned / flipped charts are mirrored: the bake keeps the geometric normal, winding does not matter
-        let u = point[0] / best.cell;
-        let w = point[1] / best.cell;
+        let u = point[0] / best.items[i].cell;
+        let w = point[1] / best.items[i].cell;
 
         if (turned) [u, w] = [w, u];
 
-        w += pad;
         if (flipped) w = h - w;
 
-        uvs[v * 2] = ((x + pad + u) * texelsPerCell) / atlasSize;
+        uvs[v * 2] = ((pad + x + u) * texelsPerCell) / atlasSize;
         uvs[v * 2 + 1] = ((y + w) * texelsPerCell) / atlasSize;
       }
     });
@@ -336,7 +459,7 @@ export function createPacker(meshes) {
       self.onmessage = ( event ) => {
         const message = event.data;
         if ( message.type === 'init' ) { meshData = message.meshData; return; }
-        const layout = packCharts( meshData, message.visible, message.atlasSize );
+        const layout = packCharts( meshData, message.visible, message.atlasSize, undefined, message.masks, message.visibleScale );
         self.postMessage( { id: message.id, layout }, layout.filter( Boolean ).map( ( uvs ) => uvs.buffer ) );
       };`;
 
@@ -359,14 +482,17 @@ export function createPacker(meshes) {
   }
 
   return {
-    pack(visible, atlasSize) {
-      if (!worker) return Promise.resolve(packCharts(meshData, visible, atlasSize));
+    pack(visible, atlasSize, masks = null, visibleScale = 2) {
+      if (!worker)
+        return Promise.resolve(
+          packCharts(meshData, visible, atlasSize, undefined, masks, visibleScale),
+        );
 
       const id = nextId++;
 
       return new Promise((resolve) => {
         pending.set(id, resolve);
-        worker.postMessage({ type: 'pack', id, visible, atlasSize });
+        worker.postMessage({ type: 'pack', id, visible, atlasSize, masks, visibleScale });
       });
     },
 

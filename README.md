@@ -84,7 +84,16 @@ renderer.setAnimationLoop(() => {
 | `shadowNoise` | `8` | Random offset of the shadow lookups (shadow map texels), softens stair-stepped edges |
 | `directionJitter` | `2` | Random tilt of the sample directions (degrees), blends the shadows of neighboring samples |
 | `specularOcclusion` | `true` | The baked visibility also darkens environment reflections |
+| `shadowBalance` | `0.5` | Shadow strength (0 to 1), higher ignores more of the weak occlusion |
+| `autoUpdate` | `false` | Moved meshes, a new environment or a new layout start a new bake. When `false`, set `needsUpdate = true` to start a bake |
 | `frustumAtlas` | `true` | Only meshes in the camera frustum get a place in the atlas |
 | `frustumMargin` | `20` | Growth of the bounding spheres for the frustum test (percent) |
+| `visibleAtlas` | `false` | Charts seen by the camera (ray test) get more atlas area |
+| `visibilityResolution` | `384` | Width of the ray grid of the visibility test |
+| `visibleScale` | `2` | Atlas area of the visible charts, times the area of the hidden ones |
 | `bounds` | mesh bounds | `Sphere`, the area that receives shadows |
 | `meshes` | scene meshes | Meshes to use, default: all meshes that cast or receive shadows |
+
+### Credits
+
+* "Island Castle" demo scene: [Sea Keep "Lonely Watcher"](https://sketchfab.com/3d-models/sea-keep-lonely-watcher-09a15a0c14cb4accaf060a92bc70413d) by [Artjoms Horosilovs](https://sketchfab.com/Artjoms_Horosilovs), [CC BY-NC-SA 4.0](http://creativecommons.org/licenses/by-nc-sa/4.0/)

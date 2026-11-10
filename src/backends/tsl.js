@@ -89,10 +89,26 @@ class EnvironmentShadowsLightingNode extends LightingNode {
     ).toVar();
 
     const weights = vec3(0.2126, 0.7152, 0.0722);
-    const visibility = clamp(dot(baked, weights).div(max(dot(unoccluded, weights), 1e-6)), 0, 1);
+    const visibility = clamp(
+      dot(baked, weights).div(max(dot(unoccluded, weights), 1e-6)),
+      0,
+      1,
+    ).toVar();
 
-    iblIrradiance.assign(baked);
-    radiance.mulAssign(mix(float(1), visibility, display.specularOcclusion));
+    // NOTE Occlusion remap: no darkening below the start, full darkening at the end.
+    // Scaling the baked light keeps its color and direction.
+    const occlusion = clamp(
+      float(1)
+        .sub(visibility)
+        .sub(display.shadowStart)
+        .div(max(display.shadowEnd.sub(display.shadowStart), 1e-4)),
+      0,
+      1,
+    );
+    const remapped = float(1).sub(occlusion).toVar();
+
+    iblIrradiance.assign(baked.mul(remapped.div(max(visibility, 1e-3))));
+    radiance.mulAssign(mix(float(1), remapped, display.specularOcclusion));
   }
 }
 
@@ -248,6 +264,8 @@ export const tslBackend = {
       blend: uniform(1).setGroup(renderGroup),
       valid: uniform(0).setGroup(renderGroup),
       specularOcclusion: uniform(1).setGroup(renderGroup),
+      shadowStart: uniform(0).setGroup(renderGroup),
+      shadowEnd: uniform(1).setGroup(renderGroup),
     };
 
     const patched = new WeakSet();
@@ -261,6 +279,8 @@ export const tslBackend = {
         blend: display.blend,
         valid: display.valid,
         specularOcclusion: display.specularOcclusion,
+        shadowStart: display.shadowStart,
+        shadowEnd: display.shadowEnd,
       },
 
       // NOTE New lightmap textures (another atlas size) need a rebuild of the patched materials

@@ -25,6 +25,11 @@ export class EnvironmentShadows {
   specularOcclusion: boolean;
   frustumAtlas: boolean;
   frustumMargin: number;
+  visibleAtlas: boolean;
+  visibilityResolution: number;
+  visibleScale: number;
+  shadowBalance: number;
+  autoUpdate: boolean;
   bounds: Sphere | null;
   needsUpdate: boolean;
 

@@ -20,6 +20,7 @@ import {
 import { createEnvironmentSampler, downsampleEquirect, halton } from './sampler.js';
 import { setLayout, unwrapMeshes } from './unwrap.js';
 import { createPacker } from './packer.js';
+import { createVisibility } from './visibility.js';
 
 // NOTE Layout attributes of the lightmap slots A and B
 const SLOTS = ['lightmapUvA', 'lightmapUvB'];
@@ -86,10 +87,16 @@ export class EnvironmentShadowsBase {
     this.shadowNoise = options.shadowNoise ?? 8;
     this.directionJitter = options.directionJitter ?? 2;
     this.specularOcclusion = options.specularOcclusion ?? true;
+    this.shadowBalance = options.shadowBalance ?? 0.5;
     this.frustumAtlas = options.frustumAtlas ?? true;
     this.frustumMargin = options.frustumMargin ?? 20;
+    this.visibleAtlas = options.visibleAtlas ?? false;
+    this.visibilityResolution = options.visibilityResolution ?? 384;
+    this.visibleScale = options.visibleScale ?? 2;
     this.bounds = options.bounds ? options.bounds.clone() : null;
     this.needsUpdate = false;
+    // NOTE false: after the first bake, new bakes only with needsUpdate (or a new atlas or shadow map size)
+    this.autoUpdate = options.autoUpdate ?? false;
 
     this._backend = backend;
     this._xatlasWasmUrl =
@@ -166,6 +173,18 @@ export class EnvironmentShadowsBase {
     this._createTargets();
 
     this._packer = createPacker(this._meshes);
+
+    // NOTE Charts seen by the camera (visibleAtlas): masks of the last visibility test and of the latest layout
+    this._visibility = createVisibility(this._meshes);
+    this._chartMasks = null;
+    this._layoutMasks = null;
+    this._visibilityMatrix = new Matrix4();
+    this._cameraMatrix = new Matrix4();
+    this._visibilityRequest = null;
+    this._visibilitySerial = 0;
+    this._visibilityTime = -Infinity;
+    this._visibilityStale = false;
+    this._moving = false;
     this._lastMatrices = this._meshes.map((mesh) => mesh.matrixWorld.clone());
 
     // NOTE Layouts (per mesh atlas UVs or null): the latest packed one, the one of the bake in progress and the
@@ -237,6 +256,9 @@ export class EnvironmentShadowsBase {
 
   // NOTE Meshes inside the camera frustum (bounding sphere grown by the margin) get a place in the atlas
   _updateVisible(camera) {
+    if (this.visibleAtlas) return this._updateVisibleCharts(camera);
+
+    this._chartMasks = null;
     camera.updateMatrixWorld();
     _matrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     _frustum.setFromProjectionMatrix(_matrix, camera.coordinateSystem);
@@ -256,20 +278,90 @@ export class EnvironmentShadowsBase {
     this._visibleKey = `${this._visible.map((v) => (v ? '1' : '0')).join('')}|${this.atlasSize}`;
   }
 
+  // NOTE Visible charts get more atlas area. The test runs when the camera stops, and every 500 ms while meshes move.
+  // _covers decides if the layout stays.
+  _updateVisibleCharts(camera) {
+    camera.updateMatrixWorld();
+    _matrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+
+    this._visibleKey = `charts${this._visibilitySerial}|${this.atlasSize}|${this.visibleScale}`;
+    this._visible = this._meshes.map((mesh) => mesh.receiveShadow);
+
+    // NOTE A moving camera cancels the test
+    if (!_matrix.equals(this._cameraMatrix)) {
+      this._cameraMatrix.copy(_matrix);
+
+      if (this._visibilityRequest) {
+        this._visibility.cancel();
+        this._visibilityRequest = null;
+      }
+
+      return;
+    }
+
+    if (this._visibilityRequest) return;
+
+    const now = performance.now();
+    const current = this._chartMasks !== null && _matrix.equals(this._visibilityMatrix);
+
+    if (current && !this._visibilityStale) return;
+    if (this._moving && now - this._visibilityTime < 500) return;
+
+    const matrix = _matrix.clone();
+    const request = this._visibility.request(camera, this.visibilityResolution, this.frustumMargin);
+
+    this._visibilityRequest = request;
+    this._visibilityTime = now;
+    this._visibilityStale = false;
+
+    request.then((masks) => {
+      if (this._visibilityRequest === request) this._visibilityRequest = null;
+      if (masks === null || this._disposed) return;
+
+      this._visibilityMatrix.copy(matrix);
+
+      if (!this._layoutMasks || !this._covers(this._layoutMasks, masks)) {
+        this._chartMasks = masks;
+        this._visibilitySerial++;
+      }
+    });
+  }
+
+  // NOTE True when the layout has every visible chart and less than twice the visible charts
+  _covers(layoutMasks, masks) {
+    let laidOut = 0;
+    let visible = 0;
+
+    for (let i = 0; i < masks.length; i++) {
+      for (let c = 0; c < masks[i].length; c++) {
+        if (masks[i][c] > 0 && layoutMasks[i][c] === 0) return false;
+
+        if (layoutMasks[i][c] > 0) laidOut++;
+        if (masks[i][c] > 0) visible++;
+      }
+    }
+
+    return laidOut < 2 * visible;
+  }
+
   // NOTE Packing runs in a worker, the bake starts when the layout is back
   _requestLayout() {
     const key = this._visibleKey;
+    const masks = this._chartMasks;
 
     this._layoutPending = true;
 
-    this._packer.pack(this._visible.slice(), this.atlasSize).then((layout) => {
-      this._layoutPending = false;
+    this._packer
+      .pack(this._visible.slice(), this.atlasSize, masks, this.visibleScale)
+      .then((layout) => {
+        this._layoutPending = false;
 
-      if (this._disposed) return;
+        if (this._disposed) return;
 
-      this._layout = layout;
-      this._layoutKey = key;
-    });
+        this._layout = layout;
+        this._layoutKey = key;
+        this._layoutMasks = masks;
+      });
   }
 
   _updateEnvironment() {
@@ -292,7 +384,7 @@ export class EnvironmentShadowsBase {
       : null;
 
     // NOTE The current front stays on screen until the bake for the new environment is done
-    this._dirty = true;
+    if (this.autoUpdate || !this._hasFront) this._dirty = true;
 
     if (!environment) this._display.uniforms.valid.value = 0;
   }
@@ -445,7 +537,17 @@ export class EnvironmentShadowsBase {
 
     if (!this._sample) return;
 
-    if (this._detectMovement() || this.needsUpdate) {
+    const moved = this._detectMovement();
+
+    // NOTE The visibility BVH is in world space
+    if (moved) {
+      this._visibility.needsRebuild = true;
+      this._visibilityStale = true;
+    }
+
+    this._moving = moved;
+
+    if ((moved && this.autoUpdate) || this.needsUpdate) {
       this._dirty = true;
       this.needsUpdate = false;
     }
@@ -455,7 +557,20 @@ export class EnvironmentShadowsBase {
 
     if (this._visibleKey !== this._layoutKey && !this._layoutPending) this._requestLayout();
 
-    if (this._layoutKey !== this._bakeKey) this._dirty = true;
+    // NOTE Without autoUpdate a new layout waits for needsUpdate, except before the first lightmap
+    const auto = this.autoUpdate || !this._hasFront;
+
+    if (auto && this._layoutKey !== this._bakeKey) this._dirty = true;
+
+    // NOTE A new layout restarts a bake on the old layout, the front lightmap stays on screen meanwhile
+    if (
+      this.autoUpdate &&
+      this._baking &&
+      this._hasFront &&
+      this._layout &&
+      this._layoutKey !== this._bakeKey
+    )
+      this._baking = false;
 
     if (!this._baking && this._dirty && this._layout) this._startBake();
 
@@ -486,7 +601,8 @@ export class EnvironmentShadowsBase {
         uniforms.blend.value = 1;
       }
 
-      if (this._count >= this._bakeSamples) {
+      // NOTE A finished bake waits for the running crossfade, a swap in the middle of it would jump
+      if (this._count >= this._bakeSamples && !(this._hasFront && this._fade < 1)) {
         this._baking = false;
 
         if (this._hasFront) {
@@ -519,6 +635,13 @@ export class EnvironmentShadowsBase {
     }
 
     uniforms.specularOcclusion.value = this.specularOcclusion ? 1 : 0;
+    // NOTE shadowBalance 0 / 0.5 / 1 gives the occlusion range 0.25-1 / 0.5-0.99 / 0.75-0.95, linear in between.
+    const balance = MathUtils.clamp(this.shadowBalance, 0, 1);
+    const lower = Math.min(1, balance * 2);
+    const upper = Math.max(0, balance * 2 - 1);
+
+    uniforms.shadowStart.value = 0.25 + 0.25 * lower + 0.25 * upper;
+    uniforms.shadowEnd.value = 1 - 0.01 * lower - 0.04 * upper;
   }
 
   /**
@@ -539,5 +662,6 @@ export class EnvironmentShadowsBase {
     this._bake.material.dispose();
     this._light.dispose();
     this._packer.dispose();
+    this._visibility.dispose();
   }
 }
