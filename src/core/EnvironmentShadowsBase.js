@@ -21,6 +21,7 @@ import { createEnvironmentSampler, downsampleEquirect, halton } from './sampler.
 import { setLayout, unwrapMeshes } from './unwrap.js';
 import { createPacker } from './packer.js';
 import { createVisibility } from './visibility.js';
+import { updateExcluded } from './exclude.js';
 
 // NOTE Layout attributes of the lightmap slots A and B
 const SLOTS = ['lightmapUvA', 'lightmapUvB'];
@@ -94,6 +95,8 @@ export class EnvironmentShadowsBase {
     this.visibilityResolution = options.visibilityResolution ?? 384;
     this.visibleScale = options.visibleScale ?? 2;
     this.bounds = options.bounds ? options.bounds.clone() : null;
+    // NOTE Meshes of these objects (and their children) do not cast shadows, but still receive them
+    this.exclude = new Set(options.exclude);
     this.needsUpdate = false;
     // NOTE false: after the first bake, new bakes only with needsUpdate (or a new atlas or shadow map size)
     this.autoUpdate = options.autoUpdate ?? false;
@@ -155,7 +158,6 @@ export class EnvironmentShadowsBase {
       proxy.matrixAutoUpdate = false;
       proxy.matrixWorldAutoUpdate = false;
       proxy.frustumCulled = false;
-      proxy.castShadow = mesh.castShadow;
       proxy.receiveShadow = true;
       this._bakeScene.add(proxy);
       return proxy;
@@ -186,6 +188,11 @@ export class EnvironmentShadowsBase {
     this._visibilityStale = false;
     this._moving = false;
     this._lastMatrices = this._meshes.map((mesh) => mesh.matrixWorld.clone());
+
+    // NOTE Excluded meshes stay unwrapped, so a change of exclude only changes the casters of the next bake
+    this._casters = this._meshes.map((mesh) => mesh.castShadow);
+    this._excluded = this._meshes.map(() => false);
+    updateExcluded(this._meshes, this.exclude, this._excluded);
 
     // NOTE Layouts (per mesh atlas UVs or null): the latest packed one, the one of the bake in progress and the
     // one of the front lightmap. Keys name the visible set and atlas size a layout was packed for.
@@ -403,7 +410,12 @@ export class EnvironmentShadowsBase {
   }
 
   _startBake() {
-    this._meshes.forEach((mesh, i) => this._proxies[i].matrixWorld.copy(mesh.matrixWorld));
+    this._meshes.forEach((mesh, i) => {
+      const proxy = this._proxies[i];
+
+      proxy.matrixWorld.copy(mesh.matrixWorld);
+      proxy.castShadow = this._casters[i] && !this._excluded[i];
+    });
 
     this._bakeLayout = this._layout;
     this._bakeKey = this._layoutKey;
@@ -538,6 +550,7 @@ export class EnvironmentShadowsBase {
     if (!this._sample) return;
 
     const moved = this._detectMovement();
+    const excludeChanged = updateExcluded(this._meshes, this.exclude, this._excluded);
 
     // NOTE The visibility BVH is in world space
     if (moved) {
@@ -547,7 +560,7 @@ export class EnvironmentShadowsBase {
 
     this._moving = moved;
 
-    if ((moved && this.autoUpdate) || this.needsUpdate) {
+    if (((moved || excludeChanged) && this.autoUpdate) || this.needsUpdate) {
       this._dirty = true;
       this.needsUpdate = false;
     }
