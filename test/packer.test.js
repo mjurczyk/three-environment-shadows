@@ -57,9 +57,9 @@ const hasPlace = (layout, unit, geometry) =>
     atlasUvs(layout, unit.base + c, chart, geometry.uv).every(([u]) => u > 0),
   );
 
-// NOTE Rasterizes the triangles of all units, counts texels covered twice and triangles outside the atlas
+// NOTE Rasterizes the triangles of all units, counts texels covered twice (in one atlas) and triangles outside
 const check = (geometries, units, layout, size) => {
-  const grid = new Uint8Array(size * size);
+  const grids = [new Uint8Array(size * size), new Uint8Array(size * size)];
   let overlap = 0;
   let outside = 0;
 
@@ -68,6 +68,7 @@ const check = (geometries, units, layout, size) => {
 
     charts.forEach((chart, c) => {
       const uvs = new Map();
+      const grid = grids[layout[(unit.base + c) * ENTRY_SIZE + 3]];
 
       atlasUvs(layout, unit.base + c, chart, uv).forEach((p, i) => uvs.set(chart.vertices[i], p));
 
@@ -141,7 +142,7 @@ describe('packer', () => {
     const geometry = createMesh(2, 1);
     const units = [0, 1, 2].map((k) => ({ geometry: 0, base: k * 2 }));
     const packer = createPacker([geometry], units, 6);
-    const layout = await packer.pack([true, true, true], 128, null, 2, [1, 1, 2]);
+    const layout = await packer.pack([true, true, true], 128, null, [1, 1, 2]);
 
     expect(check([geometry], units, layout, 128)).toEqual({ overlap: 0, outside: 0 });
 
@@ -151,6 +152,50 @@ describe('packer', () => {
       return Math.hypot(b[0] - a[0], b[1] - a[1]);
     };
     expect(width(units[2]) / width(units[0])).toBeCloseTo(2, 1);
+
+    packer.dispose();
+  });
+
+  it('packs visible charts into the primary atlas, hidden charts into the secondary atlas', async () => {
+    const geometries = [createMesh(4, 1), createMesh(4, 1)];
+    const { units, entryCount } = createUnits(geometries);
+    const packer = createPacker(geometries, units, entryCount);
+    const masks = [Uint32Array.from([3, 0, 1, 0]), Uint32Array.from([0, 0, 0, 0])];
+    const layout = await packer.pack([true, true], 128, masks);
+    const atlas = (entry) => layout[entry * ENTRY_SIZE + 3];
+
+    expect([0, 1, 2, 3, 4, 5, 6, 7].map(atlas)).toEqual([0, 1, 0, 1, 1, 1, 1, 1]);
+    expect(units.every((unit) => hasPlace(layout, unit, geometries[unit.geometry]))).toBe(true);
+    expect(check(geometries, units, layout, 128)).toEqual({ overlap: 0, outside: 0 });
+
+    // NOTE The 2 visible charts have the primary atlas to themselves, the 6 hidden ones share the secondary atlas
+    const width = (entry, unit) => {
+      const [a, b] = atlasUvs(layout, entry, geometries[unit].charts[0], geometries[unit].uv);
+
+      return Math.hypot(b[0] - a[0], b[1] - a[1]);
+    };
+    expect(width(0, 0)).toBeGreaterThan(width(4, 1) * 1.4);
+
+    packer.dispose();
+  });
+
+  it('packs the secondary atlas at its own size', async () => {
+    const geometries = [createMesh(4, 1)];
+    const { units, entryCount } = createUnits(geometries);
+    const packer = createPacker(geometries, units, entryCount);
+    const masks = [Uint32Array.from([1, 0, 0, 0])];
+    const same = await packer.pack([true], [128, 128], masks);
+    const small = await packer.pack([true], [128, 32], masks);
+
+    // NOTE Texels along the first edge of a chart: UV length times the atlas size
+    const texels = (layout, entry, size) => {
+      const [a, b] = atlasUvs(layout, entry, geometries[0].charts[entry], geometries[0].uv);
+
+      return Math.hypot(b[0] - a[0], b[1] - a[1]) * size;
+    };
+
+    expect(texels(small, 0, 128)).toBeCloseTo(texels(same, 0, 128), 5);
+    expect(texels(small, 1, 32)).toBeLessThan(texels(same, 1, 128) * 0.5);
 
     packer.dispose();
   });

@@ -39,12 +39,12 @@ import {
   renderGroup,
   screenCoordinate,
   select,
+  step,
   texture,
   textureLoad,
   textureSize,
   uniform,
   varying,
-  vec2,
   vec3,
   vec4,
 } from 'three/tsl';
@@ -72,9 +72,9 @@ function getInstance(builder) {
   return int(textureLoad(indirect, ivec2(id.mod(size), id.div(size))).x);
 }
 
-// NOTE The atlas UV of the vertex in a layout texture, see units.js. NO_PLACE without a place or chart attribute.
+// NOTE ( atlas u, atlas v, atlas: 0 primary, 1 secondary ) of the vertex, see units.js. NO_PLACE without a place.
 function getAtlasUv(layout, builder) {
-  if (!builder.hasGeometryAttribute(CHART_ATTRIBUTE)) return vec2(NO_PLACE);
+  if (!builder.hasGeometryAttribute(CHART_ATTRIBUTE)) return vec3(NO_PLACE, NO_PLACE, 0);
 
   return Fn(() => {
     const chart = attribute(CHART_ATTRIBUTE, 'vec3');
@@ -91,12 +91,13 @@ function getAtlasUv(layout, builder) {
       base.addAssign(instance.mul(int(chart.z.add(0.5))));
     });
 
-    const result = vec2(NO_PLACE).toVar();
+    const result = vec3(NO_PLACE, NO_PLACE, 0).toVar();
 
     If(index.greaterThanEqual(0).and(base.greaterThanEqual(0)), () => {
       const t = base.add(index).mul(2);
+      const row = texel(t);
 
-      result.assign(vec2(dot(texel(t).xyz, uv), dot(texel(t.add(1)).xyz, uv)));
+      result.assign(vec3(dot(row.xyz, uv), dot(texel(t.add(1)).xyz, uv), row.w));
     });
 
     return result;
@@ -108,6 +109,10 @@ const getDisplayUvs = (display, builder) => ({
   uvA: varying(getAtlasUv(display.layoutA, builder)),
   uvB: varying(getAtlasUv(display.layoutB, builder)),
 });
+
+// NOTE The lightmap of an atlas UV: z selects the primary or the secondary atlas
+const sampleLightmap = (primary, secondary, uv) =>
+  mix(texture(primary, uv.xy).rgb, texture(secondary, uv.xy).rgb, step(0.5, uv.z));
 
 // NOTE The baked lightmap replaces the environment diffuse (iblIrradiance), its visibility occludes the
 // environment specular (radiance). Runs after the environment node in the material lighting list.
@@ -138,12 +143,12 @@ class EnvironmentShadowsLightingNode extends LightingNode {
     // NOTE Atlas UVs are > 0, units without a place (UV -10) keep the unoccluded light
     const valueA = select(
       uvA.x.greaterThan(1e-6),
-      texture(display.a, uvA).rgb.mul(intensity),
+      sampleLightmap(display.a, display.secondaryA, uvA).mul(intensity),
       unoccluded,
     );
     const valueB = select(
       uvB.x.greaterThan(1e-6),
-      texture(display.b, uvB).rgb.mul(intensity),
+      sampleLightmap(display.b, display.secondaryB, uvB).mul(intensity),
       unoccluded,
     );
     const frontIsA = display.frontIsA.greaterThan(0.5);
@@ -213,6 +218,8 @@ export const tslBackend = {
       lightDirection: uniform(new Vector3(0, 1, 0)),
       // NOTE The layout texture of the bake, a placeholder here
       layout: texture(new Texture()),
+      // NOTE The atlas of this bake pass. Render group: two passes per frame, both see their value.
+      atlas: uniform(0).setGroup(renderGroup),
     };
 
     const material = new MeshLambertNodeMaterial({
@@ -237,8 +244,13 @@ export const tslBackend = {
     // Units without a place (UV -10) are outside the clip space.
     material.vertexNode = Fn((builder) => {
       const uv = getAtlasUv(uniforms.layout, builder);
+      const inAtlas = uv.z.sub(uniforms.atlas).abs().lessThan(0.5);
 
-      return vec4(uv.x.mul(2).sub(1), float(1).sub(uv.y.mul(2)), 0, 1);
+      return select(
+        inAtlas,
+        vec4(uv.x.mul(2).sub(1), float(1).sub(uv.y.mul(2)), 0, 1),
+        vec4(-2, -2, 0, 1),
+      );
     })();
 
     // NOTE Charts can be mirrored, so keep the geometric normal. The varying reads normalLocal in the vertex
@@ -328,6 +340,8 @@ export const tslBackend = {
       // before any material builds.
       a: texture(new Texture()),
       b: texture(new Texture()),
+      secondaryA: texture(new Texture()),
+      secondaryB: texture(new Texture()),
       layoutA: texture(new Texture()),
       layoutB: texture(new Texture()),
       // NOTE Render group: updated every render. Object group uniforms of materials without node properties
@@ -349,6 +363,8 @@ export const tslBackend = {
         b: display.b,
         layoutA: display.layoutA,
         layoutB: display.layoutB,
+        secondaryA: display.secondaryA,
+        secondaryB: display.secondaryB,
         frontIsA: display.frontIsA,
         blend: display.blend,
         valid: display.valid,
@@ -370,9 +386,13 @@ export const tslBackend = {
           const { uvA, uvB } = getDisplayUvs(display, builder);
           const frontIsA = display.frontIsA.greaterThan(0.5);
           const uv = select(frontIsA, uvA, uvB);
-          const color = select(frontIsA, texture(display.a, uvA), texture(display.b, uvB));
+          const color = select(
+            frontIsA,
+            sampleLightmap(display.a, display.secondaryA, uvA),
+            sampleLightmap(display.b, display.secondaryB, uvB),
+          );
 
-          return select(uv.x.greaterThan(1e-6), color.rgb, vec3(1, 0, 1));
+          return select(uv.x.greaterThan(1e-6), color, vec3(1, 0, 1));
         })();
 
         return material;

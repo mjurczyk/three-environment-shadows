@@ -19,6 +19,7 @@ export class EnvironmentShadows {
   samplesPerBake: number;
   fadeTime: number;
   atlasSize: number;
+  secondaryAtlasSize: number;
   mapSize: number;
   shadowNoise: number;
   directionJitter: number;
@@ -27,7 +28,6 @@ export class EnvironmentShadows {
   frustumMargin: number;
   visibleAtlas: boolean;
   visibilityResolution: number;
-  visibleScale: number;
   shadowBalance: number;
   autoUpdate: boolean;
   bounds: Sphere | null;

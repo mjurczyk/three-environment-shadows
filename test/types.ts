@@ -11,6 +11,7 @@ export async function usage(
 ): Promise<void> {
   const options: EnvironmentShadowsOptions = {
     samplesPerBake: 256,
+    secondaryAtlasSize: 256,
     bounds: new Sphere(new Vector3(0, 1, 0), 6),
     exclude: [new Mesh()],
   };

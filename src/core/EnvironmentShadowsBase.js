@@ -91,6 +91,8 @@ export class EnvironmentShadowsBase {
     this.samplesPerBake = options.samplesPerBake ?? 512;
     this.fadeTime = options.fadeTime ?? 0.3;
     this.atlasSize = options.atlasSize ?? 1024;
+    // NOTE Hidden charts need fewer texels, but every chart needs a few: half the primary size, at least 256
+    this.secondaryAtlasSize = options.secondaryAtlasSize ?? Math.max(256, this.atlasSize / 2);
     this.mapSize = options.mapSize ?? 512;
     this.shadowNoise = options.shadowNoise ?? 8;
     this.directionJitter = options.directionJitter ?? 2;
@@ -98,9 +100,8 @@ export class EnvironmentShadowsBase {
     this.shadowBalance = options.shadowBalance ?? 0.5;
     this.frustumAtlas = options.frustumAtlas ?? true;
     this.frustumMargin = options.frustumMargin ?? 20;
-    this.visibleAtlas = options.visibleAtlas ?? false;
+    this.visibleAtlas = options.visibleAtlas ?? true;
     this.visibilityResolution = options.visibilityResolution ?? 384;
-    this.visibleScale = options.visibleScale ?? 2;
     this.bounds = options.bounds ? options.bounds.clone() : null;
     // NOTE Meshes of these objects (and their children) do not cast shadows, but still receive them
     this.exclude = new Set(options.exclude);
@@ -246,8 +247,10 @@ export class EnvironmentShadowsBase {
     this._layout = null;
     this._layoutKey = null;
     this._layoutPending = false;
+    this._layoutGeneration = 0;
     this._bakeKey = null;
     this._bakeLayout = null;
+    this._bakeSecondary = false;
     this._visible = units.map(() => true);
     this._visibleKey = '';
 
@@ -292,9 +295,33 @@ export class EnvironmentShadowsBase {
     this._front = 0;
     this._finalize = this._backend.createFinalize(this._sumTarget.texture, size);
 
+    // NOTE The secondary atlas (charts in view that the camera does not see) exists only with visibleAtlas
+    const secondary = this.visibleAtlas;
+    const secondarySize = this.secondaryAtlasSize;
+
+    this._secondarySumTarget = secondary
+      ? makeTarget(secondarySize, this._sumType, NearestFilter)
+      : null;
+    this._secondaryLightmaps = secondary
+      ? [
+          makeTarget(secondarySize, HalfFloatType, LinearFilter),
+          makeTarget(secondarySize, HalfFloatType, LinearFilter),
+        ]
+      : null;
+    this._secondaryFinalize = secondary
+      ? this._backend.createFinalize(this._secondarySumTarget.texture, secondarySize)
+      : null;
+    this._bakeVisibleAtlas = secondary;
+    this._bakeSecondaryAtlasSize = secondarySize;
+
+    // NOTE Without a secondary atlas all charts are in the primary one, its lightmaps are placeholders
+    const secondaryLightmaps = this._secondaryLightmaps ?? this._lightmaps;
     const uniforms = this._display.uniforms;
+
     uniforms.a.value = this._lightmaps[0].texture;
     uniforms.b.value = this._lightmaps[1].texture;
+    uniforms.secondaryA.value = secondaryLightmaps[0].texture;
+    uniforms.secondaryB.value = secondaryLightmaps[1].texture;
     uniforms.frontIsA.value = 1;
     uniforms.valid.value = 0;
 
@@ -306,13 +333,14 @@ export class EnvironmentShadowsBase {
     this._sumTarget.dispose();
     for (const target of this._lightmaps) target.dispose();
     this._finalize.dispose();
+
+    this._secondarySumTarget?.dispose();
+    for (const target of this._secondaryLightmaps ?? []) target.dispose();
+    this._secondaryFinalize?.dispose();
   }
 
-  // NOTE Meshes inside the camera frustum (bounding sphere grown by the margin) get a place in the atlas
+  // NOTE Units inside the camera frustum (bounding sphere grown by the margin) get a place in the atlas
   _updateVisible(camera) {
-    if (this.visibleAtlas) return this._updateVisibleCharts(camera);
-
-    this._chartMasks = null;
     camera.updateMatrixWorld();
     _matrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     _frustum.setFromProjectionMatrix(_matrix, camera.coordinateSystem);
@@ -334,22 +362,21 @@ export class EnvironmentShadowsBase {
       return _frustum.intersectsSphere(_sphere);
     });
 
-    this._visibleKey = `${this._visible.map((v) => (v ? '1' : '0')).join('')}|${this.atlasSize}`;
+    const units = this._visible.map((v) => (v ? '1' : '0')).join('');
+
+    if (!this.visibleAtlas) {
+      this._chartMasks = null;
+      this._visibleKey = `${units}|${this.atlasSize}`;
+      return;
+    }
+
+    this._visibleKey = `${units}|charts${this._visibilitySerial}|${this.atlasSize}|${this.secondaryAtlasSize}`;
+    this._updateVisibleCharts(camera);
   }
 
-  // NOTE Visible charts get more atlas area. The test runs when the camera stops, and every 500 ms while meshes move.
-  // _covers decides if the layout stays.
+  // NOTE Charts seen by the camera go to the primary atlas. The test runs when the camera stops, every 500 ms
+  // while meshes move.
   _updateVisibleCharts(camera) {
-    camera.updateMatrixWorld();
-    _matrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-
-    this._visibleKey = `charts${this._visibilitySerial}|${this.atlasSize}|${this.visibleScale}`;
-    this._visible = this._units.map((unit) => {
-      const mesh = this._meshes[unit.mesh];
-
-      return mesh.receiveShadow && isUnitDrawn(mesh, unit.instance);
-    });
-
     // NOTE A moving camera cancels the test
     if (!_matrix.equals(this._cameraMatrix)) {
       this._cameraMatrix.copy(_matrix);
@@ -411,15 +438,22 @@ export class EnvironmentShadowsBase {
   _requestLayout() {
     const key = this._visibleKey;
     const masks = this._chartMasks;
+    const generation = this._layoutGeneration;
 
     this._layoutPending = true;
 
     this._packer
-      .pack(this._visible.slice(), this.atlasSize, masks, this.visibleScale, this._getScales())
+      .pack(
+        this._visible.slice(),
+        [this.atlasSize, this.secondaryAtlasSize],
+        masks,
+        this._getScales(),
+      )
       .then((layout) => {
         this._layoutPending = false;
 
-        if (this._disposed) return;
+        // NOTE A layout requested before a rebuild can need atlases that do not exist now
+        if (this._disposed || generation !== this._layoutGeneration) return;
 
         this._layout = layout;
         this._layoutKey = key;
@@ -538,12 +572,21 @@ export class EnvironmentShadowsBase {
     // NOTE The first bake is on screen while it converges, so the front slot uses its layout
     if (!this._hasFront) this._writeLayout(this._layoutTextures[this._front], this._bakeLayout);
 
+    // NOTE Only a layout from a visibility test has secondary charts
+    this._bakeSecondary = this._secondarySumTarget !== null && this._layoutMasks !== null;
+
     const renderer = this.renderer;
     const previous = renderer.getRenderTarget();
 
-    renderer.setRenderTarget(this._sumTarget);
     renderer.setClearColor(0x000000, 0);
-    renderer.clear();
+
+    for (const target of [this._sumTarget, this._secondarySumTarget]) {
+      if (target === null) continue;
+
+      renderer.setRenderTarget(target);
+      renderer.clear();
+    }
+
     renderer.setRenderTarget(previous);
 
     this._count = 0;
@@ -559,8 +602,6 @@ export class EnvironmentShadowsBase {
     const light = this._light;
     const camera = light.shadow.camera;
     const uniforms = this._bake.uniforms;
-
-    renderer.setRenderTarget(this._sumTarget);
 
     for (let s = 0; s < amount; s++) {
       const bakeCamera = (this._bakeCameras[s] ??= new OrthographicCamera());
@@ -607,17 +648,40 @@ export class EnvironmentShadowsBase {
       this._backend.beforeSample?.(renderer);
 
       // NOTE One shadow map + one draw of all meshes in lightmap space, added to the sum
+      uniforms.atlas.value = 0;
+      renderer.setRenderTarget(this._sumTarget);
       renderer.render(this._bakeScene, bakeCamera);
+
+      // NOTE Secondary atlas: a second draw, same shadow map. WebGPURenderer renders it once per frame and camera,
+      // WebGLRenderer skips it without autoUpdate.
+      if (this._bakeSecondary) {
+        const autoUpdate = renderer.shadowMap.autoUpdate;
+
+        renderer.shadowMap.autoUpdate = false;
+        renderer.shadowMap.needsUpdate = false;
+        uniforms.atlas.value = 1;
+        renderer.setRenderTarget(this._secondarySumTarget);
+        renderer.render(this._bakeScene, bakeCamera);
+        renderer.shadowMap.autoUpdate = autoUpdate;
+      }
+
       this._count++;
     }
   }
 
-  _renderFinalize(output) {
+  // NOTE Sums to the lightmaps of a slot
+  _renderFinalize(slot) {
     const renderer = this.renderer;
 
     this._finalize.uniforms.scale.value = this._bakeSamples;
-    renderer.setRenderTarget(output);
+    renderer.setRenderTarget(this._lightmaps[slot]);
     this._backend.renderQuad(renderer, this._finalize.material);
+
+    if (!this._bakeSecondary) return;
+
+    this._secondaryFinalize.uniforms.scale.value = this._bakeSamples;
+    renderer.setRenderTarget(this._secondaryLightmaps[slot]);
+    this._backend.renderQuad(renderer, this._secondaryFinalize.material);
   }
 
   _rebuild() {
@@ -636,6 +700,12 @@ export class EnvironmentShadowsBase {
     this._dirty = true;
     this._bakeKey = null;
 
+    // NOTE The next bake waits for a layout of the new atlases
+    this._layoutGeneration++;
+    this._layout = null;
+    this._layoutKey = null;
+    this._layoutMasks = null;
+
     for (const texture of this._layoutTextures) this._writeLayout(texture, null);
   }
 
@@ -651,7 +721,12 @@ export class EnvironmentShadowsBase {
     const delta = this._lastTime === null ? 0 : Math.min(0.1, (now - this._lastTime) / 1000);
     this._lastTime = now;
 
-    if (this.atlasSize !== this._bakeAtlasSize || this.mapSize !== this._bakeMapSize)
+    if (
+      this.atlasSize !== this._bakeAtlasSize ||
+      this.mapSize !== this._bakeMapSize ||
+      this.visibleAtlas !== this._bakeVisibleAtlas ||
+      (this.visibleAtlas && this.secondaryAtlasSize !== this._bakeSecondaryAtlasSize)
+    )
       this._rebuild();
 
     this._updateEnvironment();
@@ -718,7 +793,7 @@ export class EnvironmentShadowsBase {
 
       if (!this._hasFront) {
         // NOTE First bake: show it while it converges, there is nothing to keep on screen yet
-        this._renderFinalize(this._lightmaps[this._front]);
+        this._renderFinalize(this._front);
         uniforms.valid.value = 1;
         uniforms.blend.value = 1;
       }
@@ -731,7 +806,7 @@ export class EnvironmentShadowsBase {
           // NOTE Finish into the slot behind the front one, then flip: the new lightmap fades in over the old one
           const back = 1 - this._front;
 
-          this._renderFinalize(this._lightmaps[back]);
+          this._renderFinalize(back);
           this._writeLayout(this._layoutTextures[back], this._bakeLayout);
 
           this._front = back;

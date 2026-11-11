@@ -97,7 +97,8 @@ const LAYOUT_PARS = /* glsl */ `
     return texelFetch( lmLayout, ivec2( texel % ${LAYOUT_WIDTH}, texel / ${LAYOUT_WIDTH} ), 0 );
   }
 
-  vec2 lmAtlasUv( highp sampler2D lmLayout ) {
+  // NOTE ( atlas u, atlas v, atlas: 0 primary, 1 secondary )
+  vec3 lmAtlasUv( highp sampler2D lmLayout ) {
     #if defined( USE_INSTANCING )
       int instance = gl_InstanceID;
     #elif defined( USE_BATCHING )
@@ -112,12 +113,13 @@ const LAYOUT_PARS = /* glsl */ `
     if ( lightmapChart.z < - 0.5 ) base = int( floor( lmLayoutTexel( lmLayout, 2 * ( base + instance ) ).x + 0.5 ) );
     else base += instance * int( lightmapChart.z + 0.5 );
 
-    if ( chart < 0 || base < 0 ) return vec2( ${NO_PLACE}.0 );
+    if ( chart < 0 || base < 0 ) return vec3( ${NO_PLACE}.0, ${NO_PLACE}.0, 0.0 );
 
     int texel = 2 * ( base + chart );
     vec3 uv = vec3( lightmapUv, 1.0 );
+    vec4 row = lmLayoutTexel( lmLayout, texel );
 
-    return vec2( dot( lmLayoutTexel( lmLayout, texel ).xyz, uv ), dot( lmLayoutTexel( lmLayout, texel + 1 ).xyz, uv ) );
+    return vec3( dot( row.xyz, uv ), dot( lmLayoutTexel( lmLayout, texel + 1 ).xyz, uv ), row.w );
   }
 `;
 
@@ -125,9 +127,16 @@ const DISPLAY_VERTEX_PARS = /* glsl */ `
   ${LAYOUT_PARS}
   uniform highp sampler2D lmLayoutA;
   uniform highp sampler2D lmLayoutB;
-  varying vec2 vLmA;
-  varying vec2 vLmB;
+  varying vec3 vLmA;
+  varying vec3 vLmB;
   varying vec2 vLmHas;
+`;
+
+// NOTE The lightmap of an atlas UV: z selects the primary or the secondary atlas
+const LIGHTMAP_SAMPLE = /* glsl */ `
+  vec3 lmSample( sampler2D primary, sampler2D secondary, vec3 uv ) {
+    return mix( texture2D( primary, uv.xy ).rgb, texture2D( secondary, uv.xy ).rgb, step( 0.5, uv.z ) );
+  }
 `;
 
 // NOTE Atlas UVs are > 0, a unit without a place reads NO_PLACE (-10)
@@ -154,19 +163,23 @@ const LIGHTMAP_VERTEX = /* glsl */ `
 const LIGHTMAP_FRAGMENT = /* glsl */ `
   uniform sampler2D lmA;
   uniform sampler2D lmB;
+  uniform sampler2D lmSecondaryA;
+  uniform sampler2D lmSecondaryB;
   uniform float lmFrontIsA;
-  varying vec2 vLmA;
-  varying vec2 vLmB;
+  varying vec3 vLmA;
+  varying vec3 vLmB;
+
+  ${LIGHTMAP_SAMPLE}
 
   void main() {
-    vec2 uv = lmFrontIsA > 0.5 ? vLmA : vLmB;
+    vec3 uv = lmFrontIsA > 0.5 ? vLmA : vLmB;
 
     if ( uv.x < 1e-6 ) {
       gl_FragColor = vec4( 1.0, 0.0, 1.0, 1.0 );
       return;
     }
 
-    gl_FragColor = vec4( lmFrontIsA > 0.5 ? texture2D( lmA, vLmA ).rgb : texture2D( lmB, vLmB ).rgb, 1.0 );
+    gl_FragColor = vec4( lmFrontIsA > 0.5 ? lmSample( lmA, lmSecondaryA, vLmA ) : lmSample( lmB, lmSecondaryB, vLmB ), 1.0 );
 
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
@@ -174,17 +187,20 @@ const LIGHTMAP_FRAGMENT = /* glsl */ `
 `;
 
 const DISPLAY_FRAGMENT_PARS = /* glsl */ `
-  varying vec2 vLmA;
-  varying vec2 vLmB;
+  varying vec3 vLmA;
+  varying vec3 vLmB;
   varying vec2 vLmHas;
   uniform sampler2D lmA;
   uniform sampler2D lmB;
+  uniform sampler2D lmSecondaryA;
+  uniform sampler2D lmSecondaryB;
   uniform float lmFrontIsA;
   uniform float lmBlend;
   uniform float lmValid;
   uniform float lmSpecularOcclusion;
   uniform float lmShadowStart;
   uniform float lmShadowEnd;
+  ${LIGHTMAP_SAMPLE}
 `;
 
 // NOTE After lights_fragment_maps: iblIrradiance holds the environment diffuse, radiance the environment specular.
@@ -201,8 +217,8 @@ const DISPLAY_FRAGMENT = /* glsl */ `
       float lmIntensity = 1.0;
     #endif
 
-    vec3 lmValueA = vLmHas.x > 0.5 ? texture2D( lmA, vLmA ).rgb * lmIntensity : lmUnoccluded;
-    vec3 lmValueB = vLmHas.y > 0.5 ? texture2D( lmB, vLmB ).rgb * lmIntensity : lmUnoccluded;
+    vec3 lmValueA = vLmHas.x > 0.5 ? lmSample( lmA, lmSecondaryA, vLmA ) * lmIntensity : lmUnoccluded;
+    vec3 lmValueB = vLmHas.y > 0.5 ? lmSample( lmB, lmSecondaryB, vLmB ) * lmIntensity : lmUnoccluded;
     vec3 lmFront = lmFrontIsA > 0.5 ? lmValueA : lmValueB;
     vec3 lmPrevious = lmFrontIsA > 0.5 ? lmValueB : lmValueA;
     vec3 lmIrradiance = lmValid > 0.5 ? mix( lmPrevious, lmFront, lmBlend ) : lmUnoccluded;
@@ -251,6 +267,7 @@ export const glslBackend = {
       bakeSeed: { value: 0 },
       bakeMapTexel: { value: 1 / 512 },
       lmLayoutBake: { value: null },
+      bakeAtlas: { value: 0 },
     };
 
     const material = new MeshLambertMaterial({
@@ -283,12 +300,15 @@ export const glslBackend = {
       shader.vertexShader = shader.vertexShader
         .replace(
           'void main() {',
-          `${LAYOUT_PARS}\nuniform highp sampler2D lmLayoutBake;\nvoid main() {`,
+          `${LAYOUT_PARS}\nuniform highp sampler2D lmLayoutBake;\nuniform float bakeAtlas;\nvoid main() {`,
         )
-        // NOTE The atlas UV of this bake. Units without a place (UV -10) are outside the clip space
+        // NOTE The atlas UV of this bake. Units without a place (UV -10) and charts of the other atlas are
+        // outside the clip space.
         .replace(
           '#include <fog_vertex>',
-          '#include <fog_vertex>\ngl_Position = vec4( lmAtlasUv( lmLayoutBake ) * 2.0 - 1.0, 0.0, 1.0 );',
+          `#include <fog_vertex>
+          vec3 lmBakeUv = lmAtlasUv( lmLayoutBake );
+          gl_Position = vec4( abs( lmBakeUv.z - bakeAtlas ) < 0.5 ? lmBakeUv.xy * 2.0 - 1.0 : vec2( - 2.0 ), 0.0, 1.0 );`,
         );
 
       shader.fragmentShader = shader.fragmentShader
@@ -313,6 +333,7 @@ export const glslBackend = {
         seed: uniforms.bakeSeed,
         mapTexel: uniforms.bakeMapTexel,
         layout: uniforms.lmLayoutBake,
+        atlas: uniforms.bakeAtlas,
         // NOTE Only the TSL backend needs these
         shadowExtent: { value: 1 },
         lightDirection: { value: new Vector3() },
@@ -357,6 +378,8 @@ export const glslBackend = {
       lmShadowEnd: { value: 1 },
       lmLayoutA: { value: null },
       lmLayoutB: { value: null },
+      lmSecondaryA: { value: null },
+      lmSecondaryB: { value: null },
     };
 
     const originals = new WeakMap();
@@ -373,6 +396,8 @@ export const glslBackend = {
         shadowEnd: uniforms.lmShadowEnd,
         layoutA: uniforms.lmLayoutA,
         layoutB: uniforms.lmLayoutB,
+        secondaryA: uniforms.lmSecondaryA,
+        secondaryB: uniforms.lmSecondaryB,
       },
 
       // NOTE WebGLRenderer uploads material uniforms every frame, new textures need nothing
@@ -383,6 +408,8 @@ export const glslBackend = {
           uniforms: {
             lmA: uniforms.lmA,
             lmB: uniforms.lmB,
+            lmSecondaryA: uniforms.lmSecondaryA,
+            lmSecondaryB: uniforms.lmSecondaryB,
             lmFrontIsA: uniforms.lmFrontIsA,
             lmLayoutA: uniforms.lmLayoutA,
             lmLayoutB: uniforms.lmLayoutB,

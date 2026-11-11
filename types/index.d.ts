@@ -10,8 +10,10 @@ export interface EnvironmentShadowsOptions {
   samplesPerBake?: number;
   /** Crossfade time in seconds from the old to the new lightmap. Default 0.3. */
   fadeTime?: number;
-  /** Width and height of the lightmap atlas in texels. Default 1024. */
+  /** Width and height of the primary lightmap atlas (charts seen by the camera) in texels. Default 1024. */
   atlasSize?: number;
+  /** Width and height of the secondary lightmap atlas (other charts in view) in texels. Default: half of atlasSize. */
+  secondaryAtlasSize?: number;
   /** Width and height of the shadow map of each sample. Default 512. */
   mapSize?: number;
   /** Random offset of each shadow lookup, in shadow map texels. Softens stair-stepped edges. Default 8. */
@@ -24,12 +26,13 @@ export interface EnvironmentShadowsOptions {
   frustumAtlas?: boolean;
   /** Growth of the bounding spheres for the frustum test, in percent. Default 20. */
   frustumMargin?: number;
-  /** Whether the charts seen by the camera (ray test) get more atlas area. Default false. */
+  /**
+   * Whether the charts seen by the camera (ray test) go to the primary atlas, the other charts in view to the
+   * secondary atlas. Default true.
+   */
   visibleAtlas?: boolean;
   /** Width of the ray grid of the visibility test, the height follows the aspect. Default 384. */
   visibilityResolution?: number;
-  /** Atlas area of the visible charts, times the area of the hidden ones. Default 2. */
-  visibleScale?: number;
   /** Shadow strength, 0 to 1: higher ignores more of the weak occlusion. Default 0.5. */
   shadowBalance?: number;
   /** Whether moved meshes, a new environment or a new layout start a new bake. Default false. */
@@ -59,6 +62,7 @@ export class EnvironmentShadows {
   samplesPerBake: number;
   fadeTime: number;
   atlasSize: number;
+  secondaryAtlasSize: number;
   mapSize: number;
   shadowNoise: number;
   directionJitter: number;
@@ -67,7 +71,6 @@ export class EnvironmentShadows {
   frustumMargin: number;
   visibleAtlas: boolean;
   visibilityResolution: number;
-  visibleScale: number;
   shadowBalance: number;
   autoUpdate: boolean;
   /** The area that receives shadows, set when {@link ready} resolves if not given. */

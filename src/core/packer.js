@@ -3,13 +3,15 @@
  *
  * Charts are packed by their outline (the lowest and highest filled cell of each column) on a height
  * map, like Tetris, so curved charts nest into each other. One texel density (texels per meter) for
- * all charts, as large as fits. Packing runs in a worker, it takes ~100 ms.
+ * all charts of an atlas, as large as fits. Packing runs in a worker, it takes ~100 ms.
+ *
+ * Two atlases: the charts seen by the camera go to the primary atlas, the other charts in view to the secondary one.
  */
 
 // NOTE The atlas UV of a vertex without a place in the layout
 export const NO_PLACE = -10;
 
-// NOTE Floats per layout entry: two RGBA texels, the rows of a 2x3 matrix (see layout.js)
+// NOTE Floats per layout entry: two RGBA texels, the rows of a 2x3 matrix, texel 0 w is the atlas (units.js)
 export const ENTRY_SIZE = 8;
 
 // NOTE Self-contained (no outside references), so its source can run in a worker
@@ -273,7 +275,7 @@ function packerModule() {
     return layout;
   }
 
-  // NOTE A chart `scale` times larger: instance scale and visible charts
+  // NOTE A chart `scale` times larger (instance scale)
   const scaleChart = (chart, scale) => ({
     ...chart,
     metersPerUv: chart.metersPerUv * scale,
@@ -283,46 +285,43 @@ function packerModule() {
   });
 
   /**
-   * Packs the charts of the visible units, at the largest texel density that fits. Returns a layout: a 2x3
-   * transform per entry.
+   * Packs the charts of the visible units at the largest density that fits. Masks: visible charts go primary,
+   * hidden ones secondary.
    *
    * @param {Array} geometries - { charts, uv } per geometry, uv: the xatlas UVs.
    * @param {Array} units - { geometry, base } per unit, base: its first entry.
    * @param {number} entryCount - Entries of all units.
    * @param {Array<boolean>} visible - The units that get a place.
-   * @param {number} atlasSize - Atlas size in texels.
-   * @param {number} padding - Texels around each chart.
-   * @param {?Array<Uint32Array>} masks - Screen hits per unit chart. Visible charts get more area.
-   * @param {number} visibleScale - Area factor of the visible charts.
+   * @param {number|Array<number>} atlasSizes - Sizes of the primary and secondary atlas in texels, or one for both.
+   * @param {?Array<Uint32Array>} masks - Screen hits per unit chart, null: all charts go to the primary atlas.
    * @param {?Float32Array} scales - Chart scale per unit (instance scale).
+   * @return {Float32Array} The layout: per entry a 2x3 transform, texel 0 w is the atlas (0 or 1).
    */
   function packCharts(
     geometries,
     units,
     entryCount,
     visible,
-    atlasSize,
-    padding = atlasPadding(atlasSize),
+    atlasSizes,
     masks = null,
-    visibleScale = 2,
     scales = null,
   ) {
-    const charts = [];
+    const sizes = Array.isArray(atlasSizes) ? atlasSizes : [atlasSizes, atlasSizes];
+
+    // NOTE Charts of the primary and of the secondary atlas
+    const atlases = [[], []];
 
     units.forEach((unit, u) => {
       if (!visible[u]) return;
 
       const { charts: list, uv } = geometries[unit.geometry];
       const mask = masks ? masks[u] : null;
-      const unitScale = scales ? scales[u] : 1;
+      const scale = scales ? scales[u] : 1;
 
       list.forEach((chart, c) => {
         if (chart.metersPerUv <= 0 || chart.worldArea <= 0) return;
 
-        const visibleChart = mask && mask[c] > 0 && visibleScale !== 1;
-        const scale = unitScale * (visibleChart ? Math.sqrt(visibleScale) : 1);
-
-        charts.push({
+        atlases[mask && mask[c] === 0 ? 1 : 0].push({
           entry: unit.base + c,
           chart: scale === 1 ? chart : scaleChart(chart, scale),
           uv,
@@ -332,7 +331,16 @@ function packerModule() {
 
     const layout = emptyLayout(entryCount);
 
-    if (charts.length === 0) return layout;
+    atlases.forEach((charts, atlas) => {
+      if (charts.length > 0) packAtlas(charts, sizes[atlas], atlas, layout);
+    });
+
+    return layout;
+  }
+
+  // NOTE Packs the charts into one atlas, writes their transforms and the atlas into the layout
+  function packAtlas(charts, atlasSize, atlas, layout) {
+    const padding = atlasPadding(atlasSize);
 
     // NOTE The packing grid: cells of `texelsPerCell` texels, one texel per cell up to 2048
     const size = Math.min(atlasSize, 2048);
@@ -452,9 +460,8 @@ function packerModule() {
       layout[o + 4] = k * b[0];
       layout[o + 5] = k * b[1];
       layout[o + 6] = k * (b[2] + y);
+      layout[o + 3] = atlas;
     });
-
-    return layout;
   }
 
   return { packCharts, emptyLayout };
@@ -464,7 +471,7 @@ function packerModule() {
 export const emptyLayout = (entryCount) => packerModule().emptyLayout(entryCount);
 
 /**
- * Creates a packer, see packCharts. pack( visible, atlasSize, masks, visibleScale, scales ) resolves with a layout.
+ * Creates a packer, see packCharts. pack( visible, atlasSizes, masks, scales ) resolves with a layout.
  *
  * @param {Array<{charts: Array, uv: Float32Array}>} geometries - Unwrapped geometries, see unwrap.js.
  * @param {Array<{geometry: number, base: number}>} units - The geometry and first layout entry of each unit.
@@ -487,7 +494,7 @@ export function createPacker(geometries, units, entryCount) {
       self.onmessage = ( event ) => {
         const message = event.data;
         if ( message.type === 'init' ) { data = message; return; }
-        const layout = packCharts( data.geometries, data.units, data.entryCount, message.visible, message.atlasSize, undefined, message.masks, message.visibleScale, message.scales );
+        const layout = packCharts( data.geometries, data.units, data.entryCount, message.visible, message.atlasSizes, message.masks, message.scales );
         self.postMessage( { id: message.id, layout }, [ layout.buffer ] );
       };`;
 
@@ -510,27 +517,17 @@ export function createPacker(geometries, units, entryCount) {
   }
 
   return {
-    pack(visible, atlasSize, masks = null, visibleScale = 2, scales = null) {
+    pack(visible, atlasSizes, masks = null, scales = null) {
       if (!worker)
         return Promise.resolve(
-          packCharts(
-            geometryData,
-            unitData,
-            entryCount,
-            visible,
-            atlasSize,
-            undefined,
-            masks,
-            visibleScale,
-            scales,
-          ),
+          packCharts(geometryData, unitData, entryCount, visible, atlasSizes, masks, scales),
         );
 
       const id = nextId++;
 
       return new Promise((resolve) => {
         pending.set(id, resolve);
-        worker.postMessage({ type: 'pack', id, visible, atlasSize, masks, visibleScale, scales });
+        worker.postMessage({ type: 'pack', id, visible, atlasSizes, masks, scales });
       });
     },
 

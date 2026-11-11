@@ -46,16 +46,15 @@ const textures = new Map();
 const models = new Map();
 const bounds = new THREE.Sphere(new THREE.Vector3(0, 1, 0), 6);
 
-// NOTE Shows the front lightmap atlas in the bottom left corner
+// NOTE Shows the front lightmap atlases in the bottom left corner: primary, then secondary
 const ATLAS_SIZE = 256;
 const atlasScene = new THREE.Scene();
 const atlasCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-const atlasMaterial = new THREE.MeshBasicMaterial({
-  toneMapped: false,
-  depthTest: false,
-  depthWrite: false,
-});
-atlasScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), atlasMaterial));
+const atlasMaterials = [0, 1].map(
+  () => new THREE.MeshBasicMaterial({ toneMapped: false, depthTest: false, depthWrite: false }),
+);
+const atlasMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), atlasMaterials[0]);
+atlasScene.add(atlasMesh);
 
 let renderer;
 let scene;
@@ -210,12 +209,14 @@ const createNoise = (random, cells) => {
   };
 };
 
-const XTRA_SIZE = 1000;
+const XTRA_SIZE = 10000;
+// NOTE Heights, cube sizes, camera, fog and shadow bounds grow with the world size
+const XTRA_SCALE = XTRA_SIZE / 1000;
 const XTRA_TILES = 8;
 const XTRA_TILE_SEGMENTS = 16;
 const XTRA_CUBES = 256;
 
-// NOTE 1000 x 1000 m terrain with a noise heightmap, 256 instanced cubes of random size, exponential fog
+// NOTE 10000 x 10000 m terrain with a noise heightmap, 256 instanced cubes of random size, exponential fog
 const createXtraLarge = () => {
   const random = createRandom(188);
   const octaves = [4, 8, 16, 32].map((cells) => createNoise(random, cells));
@@ -223,7 +224,10 @@ const createXtraLarge = () => {
     const u = x / XTRA_SIZE + 0.5;
     const v = z / XTRA_SIZE + 0.5;
 
-    return octaves.reduce((sum, noise, i) => sum + (noise(u, v) - 0.5) * (80 / 2 ** i), 0);
+    return octaves.reduce(
+      (sum, noise, i) => sum + (noise(u, v) - 0.5) * ((80 * XTRA_SCALE) / 2 ** i),
+      0,
+    );
   };
 
   const group = new THREE.Group();
@@ -256,7 +260,9 @@ const createXtraLarge = () => {
         const z = position.getZ(i);
 
         position.setY(i, height(x, z));
-        n.set(height(x - 1, z) - height(x + 1, z), 2, height(x, z - 1) - height(x, z + 1));
+        const d = XTRA_SCALE;
+
+        n.set(height(x - d, z) - height(x + d, z), 2 * d, height(x, z - d) - height(x, z + d));
         n.normalize();
         normal.setXYZ(i, n.x, n.y, n.z);
       }
@@ -276,9 +282,9 @@ const createXtraLarge = () => {
   const offset = new THREE.Vector3();
   const up = new THREE.Vector3(0, 1, 0);
 
-  // NOTE Cubes of 4 to 40 m, a bit below the ground so that they do not float on slopes
+  // NOTE Cubes of 40 to 400 m, a bit below the ground so that they do not float on slopes
   for (let i = 0; i < XTRA_CUBES; i++) {
-    const size = 4 + random() * 36;
+    const size = (4 + random() * 36) * XTRA_SCALE;
     const x = (random() - 0.5) * XTRA_SIZE * 0.9;
     const z = (random() - 0.5) * XTRA_SIZE * 0.9;
 
@@ -312,11 +318,11 @@ const scenes = {
 const defaultView = { position: [8, 5, 10], target: [0, 1, 0], near: 0.1, far: 100, fog: null };
 const sceneViews = {
   'XTRA Large': {
-    position: [380, 160, 460],
+    position: [380 * XTRA_SCALE, 160 * XTRA_SCALE, 460 * XTRA_SCALE],
     target: [0, 0, 0],
-    near: 1,
-    far: 4000,
-    fog: new THREE.FogExp2(0xa0aab4, 0.0012),
+    near: XTRA_SCALE,
+    far: 4000 * XTRA_SCALE,
+    fog: new THREE.FogExp2(0xa0aab4, 0.0012 / XTRA_SCALE),
   },
 };
 
@@ -338,32 +344,30 @@ const loadModel = async (name) => {
   return models.get(name);
 };
 
+// NOTE Shadow settings of the Island Castle, the XTRA Large world uses them too
+const castleOptions = {
+  autoUpdate: true,
+  samplesPerFrame: 24,
+  samplesPerBake: 128,
+  atlasSize: 2048,
+  mapSize: 1024,
+  shadowBalance: 1,
+  visibilityResolution: 32,
+  shadowNoise: 0.5,
+  directionJitter: 8,
+  fadeTime: 0.66,
+};
+
 // NOTE Shadow settings per scene, the rest use the library defaults
 const sceneOptions = {
   Torusian: {
     autoUpdate: true,
   },
   'XTRA Large': {
-    autoUpdate: true,
-    bounds: new THREE.Sphere(new THREE.Vector3(0, 0, 0), 720),
-    samplesPerBake: 128,
-    atlasSize: 4096,
-    mapSize: 2048,
-    directionJitter: 4,
+    ...castleOptions,
+    bounds: new THREE.Sphere(new THREE.Vector3(0, 0, 0), 720 * XTRA_SCALE),
   },
-  'Island Castle': {
-    autoUpdate: true,
-    samplesPerFrame: 24,
-    samplesPerBake: 128,
-    atlasSize: 2048,
-    mapSize: 1024,
-    shadowBalance: 1,
-    visibilityResolution: 32,
-    visibleScale: 10,
-    shadowNoise: 0.5,
-    directionJitter: 8,
-    fadeTime: 0.66,
-  },
+  'Island Castle': castleOptions,
 };
 
 const createShadows = async () => {
@@ -568,7 +572,7 @@ const createGUI = () => {
   gui.add(params, 'view', views).onChange((view) => applyView(model, view));
   gui.add(params, 'environment', environments).onChange(setEnvironment);
   gui.add(params, 'rotate');
-  gui.add(params, 'atlas').name('display atlas');
+  gui.add(params, 'atlas').name('display atlases');
 
   const rebake = () => shadows && (shadows.needsUpdate = true);
 
@@ -577,16 +581,18 @@ const createGUI = () => {
   folder.add(shadows, 'samplesPerFrame', 0, 1000, 1).name('shadow maps / frame');
   folder.add(shadows, 'samplesPerBake', 0, 1000, 1).name('samples / bake').onChange(rebake);
   folder.add(shadows, 'fadeTime', 0, 2, 0.05).name('crossfade (s)');
-  folder.add(shadows, 'atlasSize', [512, 1024, 2048, 4096]).name('atlas size');
+  folder.add(shadows, 'atlasSize', [512, 1024, 2048, 4096]).name('primary atlas size');
+  folder
+    .add(shadows, 'secondaryAtlasSize', [256, 512, 1024, 2048, 4096])
+    .name('secondary atlas size');
   folder.add(shadows, 'mapSize', [512, 1024, 2048, 4096]).name('shadow map size');
   folder.add(shadows, 'shadowNoise', 0, 1000, 0.1).name('shadow noise (texels)').onChange(rebake);
   folder
     .add(shadows, 'directionJitter', 0, 1000, 0.1)
     .name('direction jitter (deg)')
     .onChange(rebake);
-  folder.add(shadows, 'visibleAtlas').name('atlas: visible charts larger (BVH)');
+  folder.add(shadows, 'visibleAtlas').name('atlas: visible charts primary (BVH)');
   folder.add(shadows, 'visibilityResolution', 32, 1024, 1).name('visibility rays (width)');
-  folder.add(shadows, 'visibleScale', 1, 16, 0.1).name('visible charts area (x)');
   folder.add(shadows, 'frustumAtlas').name('atlas: only meshes in view');
   folder.add(shadows, 'frustumMargin', 0, 1000, 1).name('view margin (%)');
   folder.add(shadows, 'specularOcclusion').name('specular occlusion');
@@ -682,19 +688,28 @@ const init = async () => {
     renderer.render(scene, camera);
 
     if (params.atlas && shadows) {
-      const texture = shadows._lightmaps[shadows._front].texture;
       // NOTE WebGLRenderer counts the viewport y from the bottom, WebGPURenderer from the top
       const bottom = document.querySelector('.bottom-tab').offsetHeight;
       const y = renderer.isWebGPURenderer ? window.innerHeight - bottom - ATLAS_SIZE : bottom;
 
-      if (atlasMaterial.map !== texture) {
-        atlasMaterial.map = texture;
-        atlasMaterial.needsUpdate = true;
-      }
+      [shadows._lightmaps, shadows._secondaryLightmaps].forEach((lightmaps, i) => {
+        if (!lightmaps) return;
 
-      renderer.setViewport(0, y, ATLAS_SIZE, ATLAS_SIZE);
-      renderer.setScissor(0, y, ATLAS_SIZE, ATLAS_SIZE);
-      renderer.render(atlasScene, atlasCamera);
+        const texture = lightmaps[shadows._front].texture;
+        const material = atlasMaterials[i];
+        const x = i * (ATLAS_SIZE + 8);
+
+        if (material.map !== texture) {
+          material.map = texture;
+          material.needsUpdate = true;
+        }
+
+        atlasMesh.material = material;
+        renderer.setViewport(x, y, ATLAS_SIZE, ATLAS_SIZE);
+        renderer.setScissor(x, y, ATLAS_SIZE, ATLAS_SIZE);
+        renderer.render(atlasScene, atlasCamera);
+      });
+
       renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
     }
 
@@ -721,7 +736,8 @@ const init = async () => {
         !shadows._dirty &&
         !shadows._layoutPending &&
         shadows._layoutKey === shadows._bakeKey &&
-        shadows._fade >= 1,
+        shadows._fade >= 1 &&
+        (!shadows.visibleAtlas || (shadows._layoutMasks !== null && !shadows._visibilityRequest)),
     };
   }
 };
