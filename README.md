@@ -71,6 +71,9 @@ renderer.setAnimationLoop(() => {
 
 * `Three.WebGLRenderer` (GLSL) r162+
 * `Three.WebGPURenderer` (TSL) r172+
+* `Three.Mesh`, `Three.InstancedMesh` and `Three.BatchedMesh` (r170+). Each instance gets its own place in the lightmap atlas.
+
+The meshes, instances and BatchedMesh geometries are read when `EnvironmentShadows` is created. Moved instances bake again, a new mesh, instance or geometry needs a new `EnvironmentShadows`. Receivers get new, unwrapped geometries (a BatchedMesh gets its geometry ranges packed again).
 
 ### Props
 
@@ -93,6 +96,7 @@ renderer.setAnimationLoop(() => {
 | `visibleScale` | `2` | Atlas area of the visible charts, times the area of the hidden ones |
 | `bounds` | mesh bounds | `Sphere`, the area that receives shadows |
 | `meshes` | scene meshes | Meshes to use, default: all meshes that cast or receive shadows |
+| `exclude` | none | Objects whose meshes (children included) do not cast shadows, they still receive. `shadows.exclude` is a `Set`, changes apply to the next bake |
 
 ### Credits
 

@@ -1,12 +1,14 @@
-import { Vector3, WebGPUCoordinateSystem } from 'three';
+import { Matrix4, Vector3, WebGPUCoordinateSystem } from 'three';
+import { getUnitMatrix, isUnitDrawn } from './units.js';
 
 /**
- * Charts seen by the camera. Rays through a grid of screen points hit a BVH of all meshes in world space.
+ * Charts seen by the camera. Rays through a grid of screen points hit a BVH of all units in world space.
  * The chart of each hit triangle is visible. The hit count of a chart is its screen coverage.
  * The rays run in Blob workers, or on this thread where there are no workers.
  */
 
 const _vector = /*@__PURE__*/ new Vector3();
+const _matrix = /*@__PURE__*/ new Matrix4();
 
 // NOTE Workers for the visibility rays, each one casts some rows of the grid
 const WORKER_COUNT =
@@ -359,24 +361,24 @@ function visibilityModule() {
 }
 
 /**
- * Visibility test of the charts of the meshes, see visibilityModule.
+ * Visibility test of the charts of the units, see visibilityModule. Masks are per unit.
  *
  * @private
  */
-export function createVisibility(meshes) {
-  const chartCounts = meshes.map((mesh) => (mesh.userData.environmentShadowCharts ?? []).length);
+export function createVisibility(meshes, units, geometries) {
+  const chartCounts = units.map((unit) => geometries[unit.geometry].charts.length);
 
   let vertexCount = 0;
   let indexCount = 0;
 
-  for (const mesh of meshes) {
-    const geometry = mesh.geometry;
+  for (const unit of units) {
+    const geometry = geometries[unit.geometry].geometry;
 
     vertexCount += geometry.attributes.position.count;
     indexCount += geometry.index ? geometry.index.count : geometry.attributes.position.count;
   }
 
-  // NOTE Merged geometry in local space, the mesh and chart of each vertex
+  // NOTE Merged geometry in local space, a copy per instance, the unit and chart of each vertex
   const local = new Float32Array(vertexCount * 3);
   const index = new Uint32Array(indexCount);
   const vertexMesh = new Int32Array(vertexCount);
@@ -385,18 +387,18 @@ export function createVisibility(meshes) {
   let vertexOffset = 0;
   let indexOffset = 0;
 
-  meshes.forEach((mesh, meshIndex) => {
-    const geometry = mesh.geometry;
+  units.forEach((unit, unitIndex) => {
+    const { geometry, charts } = geometries[unit.geometry];
     const position = geometry.attributes.position;
     const count = position.count;
 
-    vertexMesh.fill(meshIndex, vertexOffset, vertexOffset + count);
+    vertexMesh.fill(unitIndex, vertexOffset, vertexOffset + count);
 
     for (let v = 0; v < count; v++) {
       _vector.fromBufferAttribute(position, v).toArray(local, (vertexOffset + v) * 3);
     }
 
-    (mesh.userData.environmentShadowCharts ?? []).forEach((chart, c) => {
+    charts.forEach((chart, c) => {
       for (const v of chart.vertices) vertexChart[vertexOffset + v] = c;
     });
 
@@ -415,10 +417,16 @@ export function createVisibility(meshes) {
     vertexOffset += count;
   });
 
-  // NOTE The world matrices of the meshes, the BVH transforms the local positions with them
-  const matrices = new Float32Array(meshes.length * 16);
+  // NOTE World matrices of the units for the BVH. Instances that are not drawn get a zero matrix, rays miss them.
+  const matrices = new Float32Array(units.length * 16);
   const readMatrices = () =>
-    meshes.forEach((mesh, i) => mesh.matrixWorld.toArray(matrices, i * 16));
+    units.forEach((unit, i) => {
+      const mesh = meshes[unit.mesh];
+
+      if (isUnitDrawn(mesh, unit.instance))
+        getUnitMatrix(mesh, unit.instance, _matrix).toArray(matrices, i * 16);
+      else matrices.fill(0, i * 16, i * 16 + 16);
+    });
 
   readMatrices();
 
@@ -463,12 +471,12 @@ export function createVisibility(meshes) {
   }
 
   return {
-    // NOTE Set when meshes moved: the next test refits the BVH bounds, the triangles stay
+    // NOTE Set when units moved: the next test refits the BVH bounds, the triangles stay
     needsRebuild: false,
 
     /**
      * Tests `resolution` x `resolution / aspect` rays. The view is wider by `margin` (percent).
-     * Resolves per mesh a Uint32Array with the hit count of each chart, or null when cancelled.
+     * Resolves per unit a Uint32Array with the hit count of each chart, or null when cancelled.
      */
     request(camera, resolution, margin) {
       const id = ++generation;

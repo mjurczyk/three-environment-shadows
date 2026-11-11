@@ -69,7 +69,6 @@ let EnvironmentShadows;
 let model;
 let shadowControllers = [];
 let BasicMaterial;
-let createLightmapMaterial;
 // NOTE Position of the split line, 0 (left edge) to 1 (right edge)
 let split = 0.5;
 
@@ -78,7 +77,6 @@ const createRenderer = async () => {
   if (params.renderer === 'webgpu') {
     const { WebGPURenderer, MeshStandardNodeMaterial, MeshBasicNodeMaterial } =
       await import('three/webgpu');
-    const { select } = await import('three/tsl');
     const { EnvironmentShadows } = await import('../../src/webgpu.js');
 
     const webgpu = new WebGPURenderer({ antialias: true });
@@ -88,12 +86,6 @@ const createRenderer = async () => {
       renderer: webgpu,
       Material: MeshStandardNodeMaterial,
       BasicMaterial: MeshBasicNodeMaterial,
-      // NOTE The front lightmap, the texture nodes read the lightmap UV attributes
-      createLightmapMaterial: ({ a, b, frontIsA }) => {
-        const material = new MeshBasicNodeMaterial();
-        material.colorNode = select(frontIsA.greaterThan(0.5), a, b).rgb;
-        return material;
-      },
       EnvironmentShadows,
     };
   }
@@ -104,44 +96,6 @@ const createRenderer = async () => {
     renderer: new THREE.WebGLRenderer({ antialias: true }),
     Material: THREE.MeshStandardMaterial,
     BasicMaterial: THREE.MeshBasicMaterial,
-    // NOTE The front lightmap, magenta where a vertex has no place in the atlas
-    createLightmapMaterial: ({ a, b, frontIsA }) =>
-      new THREE.ShaderMaterial({
-        uniforms: { lmA: a, lmB: b, lmFrontIsA: frontIsA },
-        vertexShader: /* glsl */ `
-          attribute vec2 lightmapUvA;
-          attribute vec2 lightmapUvB;
-          varying vec2 vLmA;
-          varying vec2 vLmB;
-
-          void main() {
-            vLmA = lightmapUvA;
-            vLmB = lightmapUvB;
-            gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
-          }
-        `,
-        fragmentShader: /* glsl */ `
-          uniform sampler2D lmA;
-          uniform sampler2D lmB;
-          uniform float lmFrontIsA;
-          varying vec2 vLmA;
-          varying vec2 vLmB;
-
-          void main() {
-            vec2 uv = lmFrontIsA > 0.5 ? vLmA : vLmB;
-
-            if ( uv.x < 1e-6 ) {
-              gl_FragColor = vec4( 1.0, 0.0, 1.0, 1.0 );
-              return;
-            }
-
-            gl_FragColor = vec4( mix( texture2D( lmB, vLmB ).rgb, texture2D( lmA, vLmA ).rgb, lmFrontIsA ), 1.0 );
-
-            #include <tonemapping_fragment>
-            #include <colorspace_fragment>
-          }
-        `,
-      }),
     EnvironmentShadows,
   };
 };
@@ -228,9 +182,154 @@ const loadIslandCastle = async () => {
   return pivot;
 };
 
+// NOTE Seeded random numbers (mulberry32), the same scene on every load
+const createRandom = (seed) => () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+
+// NOTE Value noise on a grid of `cells` x `cells`, smooth between the grid points, 0 to 1
+const createNoise = (random, cells) => {
+  const grid = Float32Array.from({ length: (cells + 1) * (cells + 1) }, random);
+  const at = (x, y) => grid[y * (cells + 1) + x];
+  const smooth = (t) => t * t * (3 - 2 * t);
+
+  return (u, v) => {
+    const x = Math.min(cells - 1e-6, Math.max(0, u * cells));
+    const y = Math.min(cells - 1e-6, Math.max(0, v * cells));
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const tx = smooth(x - x0);
+    const ty = smooth(y - y0);
+    const top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+    const bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+
+    return top + (bottom - top) * ty;
+  };
+};
+
+const XTRA_SIZE = 1000;
+const XTRA_TILES = 8;
+const XTRA_TILE_SEGMENTS = 16;
+const XTRA_CUBES = 256;
+
+// NOTE 1000 x 1000 m terrain with a noise heightmap, 256 instanced cubes of random size, exponential fog
+const createXtraLarge = () => {
+  const random = createRandom(188);
+  const octaves = [4, 8, 16, 32].map((cells) => createNoise(random, cells));
+  const height = (x, z) => {
+    const u = x / XTRA_SIZE + 0.5;
+    const v = z / XTRA_SIZE + 0.5;
+
+    return octaves.reduce((sum, noise, i) => sum + (noise(u, v) - 0.5) * (80 / 2 ** i), 0);
+  };
+
+  const group = new THREE.Group();
+  const ground = new Material({ color: 0x9a9a88, roughness: 0.95 });
+  const tileSize = XTRA_SIZE / XTRA_TILES;
+
+  // NOTE 8 x 8 tiles: xatlas unwraps small meshes faster, tiles out of view get no atlas area.
+  // Normals come from the height function, so they match at the tile borders.
+  for (let tx = 0; tx < XTRA_TILES; tx++) {
+    for (let tz = 0; tz < XTRA_TILES; tz++) {
+      const geometry = new THREE.PlaneGeometry(
+        tileSize,
+        tileSize,
+        XTRA_TILE_SEGMENTS,
+        XTRA_TILE_SEGMENTS,
+      );
+      geometry.rotateX(-Math.PI / 2);
+      geometry.translate(
+        (tx + 0.5) * tileSize - XTRA_SIZE / 2,
+        0,
+        (tz + 0.5) * tileSize - XTRA_SIZE / 2,
+      );
+
+      const position = geometry.attributes.position;
+      const normal = geometry.attributes.normal;
+      const n = new THREE.Vector3();
+
+      for (let i = 0; i < position.count; i++) {
+        const x = position.getX(i);
+        const z = position.getZ(i);
+
+        position.setY(i, height(x, z));
+        n.set(height(x - 1, z) - height(x + 1, z), 2, height(x, z - 1) - height(x, z + 1));
+        n.normalize();
+        normal.setXYZ(i, n.x, n.y, n.z);
+      }
+
+      group.add(new THREE.Mesh(geometry, ground));
+    }
+  }
+
+  const cubes = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new Material({ color: 0xffffff, roughness: 0.5 }),
+    XTRA_CUBES,
+  );
+  const matrix = new THREE.Matrix4();
+  const rotation = new THREE.Quaternion();
+  const scale = new THREE.Vector3();
+  const offset = new THREE.Vector3();
+  const up = new THREE.Vector3(0, 1, 0);
+
+  // NOTE Cubes of 4 to 40 m, a bit below the ground so that they do not float on slopes
+  for (let i = 0; i < XTRA_CUBES; i++) {
+    const size = 4 + random() * 36;
+    const x = (random() - 0.5) * XTRA_SIZE * 0.9;
+    const z = (random() - 0.5) * XTRA_SIZE * 0.9;
+
+    offset.set(x, height(x, z) + size * 0.4, z);
+    rotation.setFromAxisAngle(up, random() * Math.PI);
+    scale.setScalar(size);
+    cubes.setMatrixAt(i, matrix.compose(offset, rotation, scale));
+  }
+
+  group.add(cubes);
+
+  group.traverse((object) => {
+    if (object.isMesh) {
+      object.castShadow = true;
+      object.receiveShadow = true;
+    }
+  });
+
+  group.userData.rotate = { object: group, speed: 0.02 };
+
+  return group;
+};
+
 const scenes = {
   Torusian: async () => createTorusian(),
   'Island Castle': loadIslandCastle,
+  'XTRA Large': async () => createXtraLarge(),
+};
+
+// NOTE Camera and fog per scene
+const defaultView = { position: [8, 5, 10], target: [0, 1, 0], near: 0.1, far: 100, fog: null };
+const sceneViews = {
+  'XTRA Large': {
+    position: [380, 160, 460],
+    target: [0, 0, 0],
+    near: 1,
+    far: 4000,
+    fog: new THREE.FogExp2(0xa0aab4, 0.0012),
+  },
+};
+
+const applySceneView = (name) => {
+  const view = sceneViews[name] ?? defaultView;
+
+  camera.position.fromArray(view.position);
+  camera.near = view.near;
+  camera.far = view.far;
+  camera.updateProjectionMatrix();
+  controls.target.fromArray(view.target);
+  controls.update();
+  scene.fog = view.fog;
 };
 
 const loadModel = async (name) => {
@@ -243,6 +342,14 @@ const loadModel = async (name) => {
 const sceneOptions = {
   Torusian: {
     autoUpdate: true,
+  },
+  'XTRA Large': {
+    autoUpdate: true,
+    bounds: new THREE.Sphere(new THREE.Vector3(0, 0, 0), 720),
+    samplesPerBake: 128,
+    atlasSize: 4096,
+    mapSize: 2048,
+    directionJitter: 4,
   },
   'Island Castle': {
     autoUpdate: true,
@@ -280,7 +387,7 @@ let lightmapShadows = null;
 const applyView = (target, view) => {
   if (view === 'only shadowmap' && shadows && lightmapShadows !== shadows) {
     lightmapMaterial?.dispose();
-    lightmapMaterial = createLightmapMaterial(shadows._display.uniforms);
+    lightmapMaterial = shadows._display.createLightmapMaterial();
     lightmapShadows = shadows;
   }
 
@@ -332,6 +439,7 @@ const setScene = async (name) => {
   model = next;
   applyView(model, 'combined');
   scene.add(model);
+  applySceneView(name);
 
   shadows?.dispose();
   shadows = null;
@@ -497,7 +605,6 @@ const init = async () => {
   renderer = created.renderer;
   Material = created.Material;
   BasicMaterial = created.BasicMaterial;
-  createLightmapMaterial = created.createLightmapMaterial;
   EnvironmentShadows = created.EnvironmentShadows;
   renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
   renderer.setSize(window.innerWidth, window.innerHeight);
@@ -517,6 +624,7 @@ const init = async () => {
 
   model = await loadModel(params.scene);
   scene.add(model);
+  applySceneView(params.scene);
 
   // NOTE Drag the split line to move it
   const splitLine = document.querySelector('.split-line');

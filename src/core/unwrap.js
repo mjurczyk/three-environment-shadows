@@ -1,18 +1,18 @@
 import { BufferAttribute, BufferGeometry } from 'three';
 import xatlasSource from 'xatlas-web/dist/xatlas-web.js?raw';
-import { NO_PLACE } from './packer.js';
+import { extractGeometry, getGeometryIds, setUnwrappedGeometries } from './batched.js';
 
 /**
  * Lightmap unwrap of the receivers, with xatlas, in a worker.
  *
  * Each receiver is unwrapped once. The result is split into charts (connected UV islands), each turned
- * to its smallest bounding rect. A layout (see packer.js) is a per-vertex atlas UV, so the geometry is
+ * to its smallest bounding rect. A layout (see units.js) is a transform per chart, so the geometry is
  * shared between layouts. Receivers get new geometries (xatlas splits vertices at seams), positions,
- * normals and uvs do not change.
+ * normals and uvs do not change. A BatchedMesh is unwrapped per geometry.
  */
 
-// NOTE The atlas UVs of the bake in progress and of the two lightmap slots (A, B), one layout each
-export const UV_ATTRIBUTES = ['lightmapUvBake', 'lightmapUvA', 'lightmapUvB'];
+// NOTE The chart of each vertex ( chart + 1, base, stride ), 0 without a chart. See units.js.
+export const CHART_ATTRIBUTE = 'lightmapChart';
 
 // NOTE Self-contained (no outside references), so its source can run in a worker. Plain arrays only.
 function unwrapModule() {
@@ -441,11 +441,59 @@ const toArray = (attribute) => {
   return array;
 };
 
+// NOTE Geometries without charts (casters) get zero lightmap attributes: no place in any layout
+function addEmptyAttributes(geometry) {
+  const count = geometry.attributes.position.count;
+
+  if (!geometry.attributes.lightmapUv)
+    geometry.setAttribute('lightmapUv', new BufferAttribute(new Float32Array(count * 2), 2));
+
+  if (!geometry.attributes[CHART_ATTRIBUTE])
+    geometry.setAttribute(CHART_ATTRIBUTE, new BufferAttribute(new Float32Array(count * 3), 3));
+
+  return geometry;
+}
+
+// NOTE Plain copy of a geometry for the worker, positions in world space with `matrix`
+function toUnwrapInput(geometry, matrix) {
+  const attributes = {};
+
+  for (const name of Object.keys(geometry.attributes)) {
+    const attribute = geometry.attributes[name];
+
+    attributes[name] = {
+      array: attribute.isInterleavedBufferAttribute ? toArray(attribute) : attribute.array.slice(),
+      itemSize: attribute.itemSize,
+      normalized: attribute.normalized,
+    };
+  }
+
+  return {
+    index: geometry.index ? Uint32Array.from(geometry.index.array) : null,
+    attributes,
+    matrix: Float32Array.from(matrix.elements),
+  };
+}
+
+// NOTE The worker result as a geometry with the lightmap attributes
+function toGeometry({ index, attributes }) {
+  const geometry = new BufferGeometry();
+
+  for (const [name, { array, itemSize, normalized }] of Object.entries(attributes)) {
+    geometry.setAttribute(name, new BufferAttribute(array, itemSize, normalized));
+  }
+
+  geometry.setIndex(new BufferAttribute(index, 1));
+  addEmptyAttributes(geometry);
+  geometry.computeBoundingSphere();
+  geometry.computeBoundingBox();
+
+  return geometry;
+}
+
 /**
- * Unwraps the receivers once (cached on the meshes), in a worker. Each receiver gets new geometry with
- * `lightmapUv` (xatlas charts in 0..1), the layout attributes (see UV_ATTRIBUTES) and
- * `userData.environmentShadowCharts`. Casters that do not receive only get the layout attributes, without
- * a place in the atlas.
+ * Unwraps the receivers once, in a worker. Receivers get new geometries with `lightmapUv` and `lightmapChart`,
+ * casters get zero lightmap attributes.
  *
  * @param {Array<Mesh>} receivers - Meshes that get a place in the lightmap.
  * @param {Array<Mesh>} casters - Meshes that only cast shadows.
@@ -453,84 +501,84 @@ const toArray = (attribute) => {
  */
 export async function unwrapMeshes(receivers, casters, wasmUrl) {
   for (const mesh of casters) {
-    const geometry = mesh.geometry;
-    const count = geometry.attributes.position.count;
-
-    for (const name of UV_ATTRIBUTES) {
-      if (!geometry.attributes[name]) {
-        geometry.setAttribute(
-          name,
-          new BufferAttribute(new Float32Array(count * 2).fill(NO_PLACE), 2),
-        );
-      }
+    if (!mesh.isBatchedMesh) {
+      addEmptyAttributes(mesh.geometry);
+      continue;
     }
+
+    if (mesh.userData.environmentShadowBatch) continue;
+
+    const geometries = new Map();
+
+    for (const id of getGeometryIds(mesh)) {
+      geometries.set(id, { geometry: addEmptyAttributes(extractGeometry(mesh, id)), charts: [] });
+    }
+
+    mesh.userData.environmentShadowBatch = { receives: false, geometries };
   }
 
-  const pending = receivers.filter((mesh) => !mesh.userData.environmentShadowCharts);
+  // NOTE One job per geometry: the worker input and the result handler. Charts go to userData, see units.js.
+  const jobs = [];
 
-  if (pending.length === 0) return;
-
-  const meshes = pending.map((mesh) => {
+  for (const mesh of receivers) {
     mesh.updateMatrixWorld();
 
-    const geometry = mesh.geometry;
-    const attributes = {};
+    if (mesh.isBatchedMesh) {
+      if (mesh.userData.environmentShadowBatch?.receives) continue;
 
-    for (const name of Object.keys(geometry.attributes)) {
-      const attribute = geometry.attributes[name];
+      const geometries = new Map();
 
-      attributes[name] = {
-        array: attribute.isInterleavedBufferAttribute
-          ? toArray(attribute)
-          : attribute.array.slice(),
-        itemSize: attribute.itemSize,
-        normalized: attribute.normalized,
-      };
+      mesh.userData.environmentShadowBatch = { receives: true, geometries };
+
+      for (const id of getGeometryIds(mesh)) {
+        jobs.push({
+          input: toUnwrapInput(extractGeometry(mesh, id), mesh.matrixWorld),
+          done: (geometry, charts) => geometries.set(id, { geometry, charts }),
+        });
+      }
+
+      continue;
     }
 
-    return {
-      index: geometry.index ? Uint32Array.from(geometry.index.array) : null,
-      attributes,
-      matrix: Float32Array.from(mesh.matrixWorld.elements),
-    };
-  });
+    if (mesh.userData.environmentShadowCharts) continue;
 
-  const results = await runUnwrap(wasmUrl, meshes);
+    jobs.push({
+      input: toUnwrapInput(mesh.geometry, mesh.matrixWorld),
+      done: (geometry, charts) => {
+        mesh.userData.environmentShadowCharts = charts;
+        mesh.geometry.dispose();
+        mesh.geometry = geometry;
+      },
+    });
+  }
 
-  pending.forEach((mesh, i) => {
-    const { index, attributes, charts } = results[i];
-    const geometry = new BufferGeometry();
+  if (jobs.length === 0) return;
 
-    for (const [name, { array, itemSize, normalized }] of Object.entries(attributes)) {
-      geometry.setAttribute(name, new BufferAttribute(array, itemSize, normalized));
+  const results = await runUnwrap(
+    wasmUrl,
+    jobs.map((job) => job.input),
+  );
+
+  jobs.forEach((job, i) => job.done(toGeometry(results[i]), results[i].charts));
+
+  for (const mesh of receivers) {
+    const batch = mesh.userData.environmentShadowBatch;
+
+    if (!mesh.isBatchedMesh || batch.applied) continue;
+
+    // NOTE In the batch, the chart attribute reads the base from the table (stride -1), see units.js
+    for (const { geometry, charts } of batch.geometries.values()) {
+      const chart = geometry.attributes[CHART_ATTRIBUTE];
+
+      charts.forEach((c, k) => {
+        for (const v of c.vertices) chart.setXYZ(v, k + 1, 0, -1);
+      });
     }
 
-    const count = geometry.attributes.position.count;
-
-    for (const name of UV_ATTRIBUTES) {
-      geometry.setAttribute(
-        name,
-        new BufferAttribute(new Float32Array(count * 2).fill(NO_PLACE), 2),
-      );
-    }
-
-    geometry.setIndex(new BufferAttribute(index, 1));
-    geometry.computeBoundingSphere();
-
-    mesh.userData.environmentShadowCharts = charts;
-    mesh.geometry.dispose();
-    mesh.geometry = geometry;
-  });
-}
-
-/** Writes a layout into one of the UV attributes of every mesh. */
-export function setLayout(meshes, name, layout) {
-  meshes.forEach((mesh, i) => {
-    const attribute = mesh.geometry.attributes[name];
-
-    if (layout[i]) attribute.array.set(layout[i]);
-    else attribute.array.fill(NO_PLACE);
-
-    attribute.needsUpdate = true;
-  });
+    setUnwrappedGeometries(
+      mesh,
+      new Map([...batch.geometries].map(([id, { geometry }]) => [id, geometry])),
+    );
+    batch.applied = true;
+  }
 }

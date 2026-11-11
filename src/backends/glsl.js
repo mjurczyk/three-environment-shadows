@@ -15,6 +15,8 @@ import {
   ShaderMaterial,
   Vector3,
 } from 'three';
+import { NO_PLACE } from '../core/packer.js';
+import { LAYOUT_WIDTH } from '../core/units.js';
 
 /**
  * GLSL backend for WebGLRenderer: materials are patched with onBeforeCompile.
@@ -82,19 +84,93 @@ const FINALIZE_FRAGMENT = /* glsl */ `
   }
 `;
 
+// NOTE The instance id expression of the batching chunk of this three.js version
+const BATCH_INSTANCE =
+  ShaderChunk.batching_vertex?.match(/getBatchingMatrix\(\s*(.+?)\s*\);/)?.[1] ?? null;
+
+// NOTE Atlas UV of a vertex in a layout texture, see units.js. A missing chart attribute reads 0: no place.
+const LAYOUT_PARS = /* glsl */ `
+  attribute vec2 lightmapUv;
+  attribute vec3 lightmapChart;
+
+  vec4 lmLayoutTexel( highp sampler2D lmLayout, int texel ) {
+    return texelFetch( lmLayout, ivec2( texel % ${LAYOUT_WIDTH}, texel / ${LAYOUT_WIDTH} ), 0 );
+  }
+
+  vec2 lmAtlasUv( highp sampler2D lmLayout ) {
+    #if defined( USE_INSTANCING )
+      int instance = gl_InstanceID;
+    #elif defined( USE_BATCHING )
+      int instance = int( ${BATCH_INSTANCE ?? '0.0'} );
+    #else
+      int instance = 0;
+    #endif
+
+    int chart = int( lightmapChart.x + 0.5 ) - 1;
+    int base = int( floor( lightmapChart.y + 0.5 ) );
+
+    if ( lightmapChart.z < - 0.5 ) base = int( floor( lmLayoutTexel( lmLayout, 2 * ( base + instance ) ).x + 0.5 ) );
+    else base += instance * int( lightmapChart.z + 0.5 );
+
+    if ( chart < 0 || base < 0 ) return vec2( ${NO_PLACE}.0 );
+
+    int texel = 2 * ( base + chart );
+    vec3 uv = vec3( lightmapUv, 1.0 );
+
+    return vec2( dot( lmLayoutTexel( lmLayout, texel ).xyz, uv ), dot( lmLayoutTexel( lmLayout, texel + 1 ).xyz, uv ) );
+  }
+`;
+
 const DISPLAY_VERTEX_PARS = /* glsl */ `
-  attribute vec2 lightmapUvA;
-  attribute vec2 lightmapUvB;
+  ${LAYOUT_PARS}
+  uniform highp sampler2D lmLayoutA;
+  uniform highp sampler2D lmLayoutB;
   varying vec2 vLmA;
   varying vec2 vLmB;
   varying vec2 vLmHas;
 `;
 
-// NOTE Atlas UVs are > 0, a mesh without a place reads -10, a missing attribute (a mesh that shares the material) 0
+// NOTE Atlas UVs are > 0, a unit without a place reads NO_PLACE (-10)
 const DISPLAY_VERTEX = /* glsl */ `
-  vLmA = lightmapUvA;
-  vLmB = lightmapUvB;
-  vLmHas = vec2( step( 1e-6, lightmapUvA.x ), step( 1e-6, lightmapUvB.x ) );
+  vLmA = lmAtlasUv( lmLayoutA );
+  vLmB = lmAtlasUv( lmLayoutB );
+  vLmHas = vec2( step( 1e-6, vLmA.x ), step( 1e-6, vLmB.x ) );
+`;
+
+// NOTE Debug view: the front lightmap, magenta where a unit has no place in the atlas
+const LIGHTMAP_VERTEX = /* glsl */ `
+  #include <common>
+  #include <batching_pars_vertex>
+  ${DISPLAY_VERTEX_PARS}
+
+  void main() {
+    #include <batching_vertex>
+    #include <begin_vertex>
+    #include <project_vertex>
+    ${DISPLAY_VERTEX}
+  }
+`;
+
+const LIGHTMAP_FRAGMENT = /* glsl */ `
+  uniform sampler2D lmA;
+  uniform sampler2D lmB;
+  uniform float lmFrontIsA;
+  varying vec2 vLmA;
+  varying vec2 vLmB;
+
+  void main() {
+    vec2 uv = lmFrontIsA > 0.5 ? vLmA : vLmB;
+
+    if ( uv.x < 1e-6 ) {
+      gl_FragColor = vec4( 1.0, 0.0, 1.0, 1.0 );
+      return;
+    }
+
+    gl_FragColor = vec4( lmFrontIsA > 0.5 ? texture2D( lmA, vLmA ).rgb : texture2D( lmB, vLmB ).rgb, 1.0 );
+
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }
 `;
 
 const DISPLAY_FRAGMENT_PARS = /* glsl */ `
@@ -159,6 +235,8 @@ quad.frustumCulled = false;
 const quadCamera = new OrthographicCamera();
 
 export const glslBackend = {
+  supportsBatchedMesh: BATCH_INSTANCE !== null,
+
   getSumType(renderer) {
     // NOTE Blending into 32-bit float targets needs EXT_float_blend, three.js does not enable it
     return renderer.getContext().getExtension('EXT_float_blend') !== null
@@ -172,6 +250,7 @@ export const glslBackend = {
       bakeNoise: { value: 0 },
       bakeSeed: { value: 0 },
       bakeMapTexel: { value: 1 / 512 },
+      lmLayoutBake: { value: null },
     };
 
     const material = new MeshLambertMaterial({
@@ -202,11 +281,14 @@ export const glslBackend = {
       Object.assign(shader.uniforms, uniforms);
 
       shader.vertexShader = shader.vertexShader
-        .replace('void main() {', 'attribute vec2 lightmapUvBake;\nvoid main() {')
-        // NOTE The atlas UV of this bake. Meshes without a place (UV -10) are outside the clip space
+        .replace(
+          'void main() {',
+          `${LAYOUT_PARS}\nuniform highp sampler2D lmLayoutBake;\nvoid main() {`,
+        )
+        // NOTE The atlas UV of this bake. Units without a place (UV -10) are outside the clip space
         .replace(
           '#include <fog_vertex>',
-          '#include <fog_vertex>\ngl_Position = vec4( lightmapUvBake * 2.0 - 1.0, 0.0, 1.0 );',
+          '#include <fog_vertex>\ngl_Position = vec4( lmAtlasUv( lmLayoutBake ) * 2.0 - 1.0, 0.0, 1.0 );',
         );
 
       shader.fragmentShader = shader.fragmentShader
@@ -230,6 +312,7 @@ export const glslBackend = {
         noise: uniforms.bakeNoise,
         seed: uniforms.bakeSeed,
         mapTexel: uniforms.bakeMapTexel,
+        layout: uniforms.lmLayoutBake,
         // NOTE Only the TSL backend needs these
         shadowExtent: { value: 1 },
         lightDirection: { value: new Vector3() },
@@ -272,6 +355,8 @@ export const glslBackend = {
       lmSpecularOcclusion: { value: 1 },
       lmShadowStart: { value: 0 },
       lmShadowEnd: { value: 1 },
+      lmLayoutA: { value: null },
+      lmLayoutB: { value: null },
     };
 
     const originals = new WeakMap();
@@ -286,10 +371,26 @@ export const glslBackend = {
         specularOcclusion: uniforms.lmSpecularOcclusion,
         shadowStart: uniforms.lmShadowStart,
         shadowEnd: uniforms.lmShadowEnd,
+        layoutA: uniforms.lmLayoutA,
+        layoutB: uniforms.lmLayoutB,
       },
 
       // NOTE WebGLRenderer uploads material uniforms every frame, new textures need nothing
       refresh() {},
+
+      createLightmapMaterial() {
+        return new ShaderMaterial({
+          uniforms: {
+            lmA: uniforms.lmA,
+            lmB: uniforms.lmB,
+            lmFrontIsA: uniforms.lmFrontIsA,
+            lmLayoutA: uniforms.lmLayoutA,
+            lmLayoutB: uniforms.lmLayoutB,
+          },
+          vertexShader: LIGHTMAP_VERTEX,
+          fragmentShader: LIGHTMAP_FRAGMENT,
+        });
+      },
 
       patch(material) {
         if (originals.has(material)) return;

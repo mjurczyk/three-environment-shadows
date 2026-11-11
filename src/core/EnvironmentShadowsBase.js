@@ -5,6 +5,7 @@ import {
   DirectionalLight,
   Frustum,
   HalfFloatType,
+  InstancedMesh,
   LinearFilter,
   MathUtils,
   Matrix4,
@@ -18,16 +19,23 @@ import {
   WebGLRenderTarget,
 } from 'three';
 import { createEnvironmentSampler, downsampleEquirect, halton } from './sampler.js';
-import { setLayout, unwrapMeshes } from './unwrap.js';
+import { unwrapMeshes } from './unwrap.js';
 import { createPacker } from './packer.js';
 import { createVisibility } from './visibility.js';
-
-// NOTE Layout attributes of the lightmap slots A and B
-const SLOTS = ['lightmapUvA', 'lightmapUvB'];
+import { updateExcluded } from './exclude.js';
+import { isBatchedSupported, isInstanceVisible } from './batched.js';
+import {
+  createLayoutTexture,
+  createUnits,
+  getUnitMatrix,
+  isUnitDrawn,
+  writeLayout,
+} from './units.js';
 
 const _box = /*@__PURE__*/ new Box3();
 const _sphere = /*@__PURE__*/ new Sphere();
 const _matrix = /*@__PURE__*/ new Matrix4();
+const _unitMatrix = /*@__PURE__*/ new Matrix4();
 const _frustum = /*@__PURE__*/ new Frustum();
 const _clearColor = /*@__PURE__*/ new Color();
 const _axis = /*@__PURE__*/ new Vector3();
@@ -94,6 +102,8 @@ export class EnvironmentShadowsBase {
     this.visibilityResolution = options.visibilityResolution ?? 384;
     this.visibleScale = options.visibleScale ?? 2;
     this.bounds = options.bounds ? options.bounds.clone() : null;
+    // NOTE Meshes of these objects (and their children) do not cast shadows, but still receive them
+    this.exclude = new Set(options.exclude);
     this.needsUpdate = false;
     // NOTE false: after the first bake, new bakes only with needsUpdate (or a new atlas or shadow map size)
     this.autoUpdate = options.autoUpdate ?? false;
@@ -119,8 +129,18 @@ export class EnvironmentShadowsBase {
 
     this.scene.updateMatrixWorld();
 
-    this._receivers = list.filter((mesh) => mesh.receiveShadow);
-    this._meshes = list.filter((mesh) => mesh.receiveShadow || mesh.castShadow);
+    // NOTE A BatchedMesh needs three.js internals (r170+), and the instance id in the shaders
+    const supported = list.filter((mesh) => {
+      if (!mesh.isBatchedMesh) return true;
+      if (this._backend.supportsBatchedMesh && isBatchedSupported(mesh)) return true;
+
+      console.warn('EnvironmentShadows: BatchedMesh needs three.js r170+, skipped', mesh);
+
+      return false;
+    });
+
+    this._receivers = supported.filter((mesh) => mesh.receiveShadow);
+    this._meshes = supported.filter((mesh) => mesh.receiveShadow || mesh.castShadow);
 
     await unwrapMeshes(
       this._receivers,
@@ -143,23 +163,46 @@ export class EnvironmentShadowsBase {
     const backend = this._backend;
     const renderer = this.renderer;
 
-    // NOTE Bake scene: proxies share the geometry, their transforms are a snapshot taken at bake start
+    // NOTE Units: meshes and instances, each with its own place in the atlas (see units.js)
+    const { geometries, units, proxies, entryCount, table } = createUnits(this._meshes);
+
+    this._units = units;
+    this._geometries = geometries;
+    this._table = table;
+
+    // NOTE Bake scene: proxies share the geometry, transforms are a snapshot at bake start. BatchedMesh: one
+    // InstancedMesh proxy per geometry.
     this._bakeScene = new Scene();
     // NOTE One camera per sample of a frame: WebGPURenderer renders a shadow map at most once per frame and camera.
     // The cameras are the same, the bake draws in lightmap space and only uses them for view space normals.
     this._bakeCameras = [];
     this._bake = backend.createBakeMaterial();
 
-    this._proxies = this._meshes.map((mesh) => {
-      const proxy = new Mesh(mesh.geometry, this._bake.material);
+    this._proxies = proxies.map(({ mesh, geometry, instances }) => {
+      const source = this._meshes[mesh];
+      const proxy =
+        instances !== null
+          ? new InstancedMesh(geometry, this._bake.material, instances.length)
+          : source.isInstancedMesh
+            ? new InstancedMesh(geometry, this._bake.material, source.instanceMatrix.count)
+            : new Mesh(geometry, this._bake.material);
+
       proxy.matrixAutoUpdate = false;
       proxy.matrixWorldAutoUpdate = false;
       proxy.frustumCulled = false;
-      proxy.castShadow = mesh.castShadow;
       proxy.receiveShadow = true;
       this._bakeScene.add(proxy);
-      return proxy;
+
+      return { proxy, mesh, instances };
     });
+
+    // NOTE Layout textures: the bake in progress and the lightmap slots A and B
+    this._bakeLayoutTexture = createLayoutTexture(entryCount, table);
+    this._layoutTextures = [
+      createLayoutTexture(entryCount, table),
+      createLayoutTexture(entryCount, table),
+    ];
+    this._bake.uniforms.layout.value = this._bakeLayoutTexture;
 
     this._light = new DirectionalLight(0xffffff, 1);
     this._light.castShadow = true;
@@ -170,12 +213,14 @@ export class EnvironmentShadowsBase {
 
     this._sumType = backend.getSumType(renderer);
     this._display = backend.createDisplay();
+    this._display.uniforms.layoutA.value = this._layoutTextures[0];
+    this._display.uniforms.layoutB.value = this._layoutTextures[1];
     this._createTargets();
 
-    this._packer = createPacker(this._meshes);
+    this._packer = createPacker(geometries, units, entryCount);
 
-    // NOTE Charts seen by the camera (visibleAtlas): masks of the last visibility test and of the latest layout
-    this._visibility = createVisibility(this._meshes);
+    // NOTE Charts seen by the camera (visibleAtlas): masks per unit of the last test and of the latest layout
+    this._visibility = createVisibility(this._meshes, units, geometries);
     this._chartMasks = null;
     this._layoutMasks = null;
     this._visibilityMatrix = new Matrix4();
@@ -185,16 +230,25 @@ export class EnvironmentShadowsBase {
     this._visibilityTime = -Infinity;
     this._visibilityStale = false;
     this._moving = false;
-    this._lastMatrices = this._meshes.map((mesh) => mesh.matrixWorld.clone());
 
-    // NOTE Layouts (per mesh atlas UVs or null): the latest packed one, the one of the bake in progress and the
-    // one of the front lightmap. Keys name the visible set and atlas size a layout was packed for.
+    // NOTE World matrix and drawn state of each unit, to detect movement
+    this._lastMatrices = new Float64Array(units.length * 16);
+    this._drawn = units.map(() => false);
+    this._detectMovement();
+
+    // NOTE Excluded meshes stay unwrapped, so a change of exclude only changes the casters of the next bake
+    this._casters = this._meshes.map((mesh) => mesh.castShadow);
+    this._excluded = this._meshes.map(() => false);
+    updateExcluded(this._meshes, this.exclude, this._excluded);
+
+    // NOTE Layouts (chart transforms, see units.js): the latest one and the one of the bake. Keys name the
+    // visible set and atlas size.
     this._layout = null;
     this._layoutKey = null;
     this._layoutPending = false;
     this._bakeKey = null;
-    this._bakeLayout = this._meshes.map(() => null);
-    this._visible = this._meshes.map(() => true);
+    this._bakeLayout = null;
+    this._visible = units.map(() => true);
     this._visibleKey = '';
 
     this._environment = null;
@@ -263,13 +317,18 @@ export class EnvironmentShadowsBase {
     _matrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     _frustum.setFromProjectionMatrix(_matrix, camera.coordinateSystem);
 
-    this._visible = this._meshes.map((mesh) => {
-      if (!mesh.receiveShadow) return false;
+    this._visible = this._units.map((unit) => {
+      const mesh = this._meshes[unit.mesh];
+
+      if (!mesh.receiveShadow || !isUnitDrawn(mesh, unit.instance)) return false;
       if (!this.frustumAtlas) return true;
 
-      if (mesh.geometry.boundingSphere === null) mesh.geometry.computeBoundingSphere();
+      const geometry = this._geometries[unit.geometry].geometry;
 
-      _sphere.copy(mesh.geometry.boundingSphere).applyMatrix4(mesh.matrixWorld);
+      if (geometry.boundingSphere === null) geometry.computeBoundingSphere();
+
+      getUnitMatrix(mesh, unit.instance, _unitMatrix);
+      _sphere.copy(geometry.boundingSphere).applyMatrix4(_unitMatrix);
       _sphere.radius *= 1 + this.frustumMargin / 100;
 
       return _frustum.intersectsSphere(_sphere);
@@ -285,7 +344,11 @@ export class EnvironmentShadowsBase {
     _matrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
 
     this._visibleKey = `charts${this._visibilitySerial}|${this.atlasSize}|${this.visibleScale}`;
-    this._visible = this._meshes.map((mesh) => mesh.receiveShadow);
+    this._visible = this._units.map((unit) => {
+      const mesh = this._meshes[unit.mesh];
+
+      return mesh.receiveShadow && isUnitDrawn(mesh, unit.instance);
+    });
 
     // NOTE A moving camera cancels the test
     if (!_matrix.equals(this._cameraMatrix)) {
@@ -352,7 +415,7 @@ export class EnvironmentShadowsBase {
     this._layoutPending = true;
 
     this._packer
-      .pack(this._visible.slice(), this.atlasSize, masks, this.visibleScale)
+      .pack(this._visible.slice(), this.atlasSize, masks, this.visibleScale, this._getScales())
       .then((layout) => {
         this._layoutPending = false;
 
@@ -389,28 +452,91 @@ export class EnvironmentShadowsBase {
     if (!environment) this._display.uniforms.valid.value = 0;
   }
 
+  // NOTE WebGPURenderer uploads a texture only when a binding of it refreshes. Unchanged objects do not refresh,
+  // so upload here.
+  _writeLayout(texture, layout) {
+    writeLayout(texture, layout, this._table);
+    this.renderer.initTexture(texture);
+  }
+
+  // NOTE Instance scale (cube root of the volume scale) per unit: the charts were measured without it
+  _getScales() {
+    return Float32Array.from(this._units, (unit) => {
+      const mesh = this._meshes[unit.mesh];
+
+      if (unit.instance < 0 || !isUnitDrawn(mesh, unit.instance)) return 1;
+
+      mesh.getMatrixAt(unit.instance, _matrix);
+
+      return Math.max(1e-3, Math.cbrt(Math.abs(_matrix.determinant())));
+    });
+  }
+
+  // NOTE A unit moved when its world matrix or drawn state changed
   _detectMovement() {
+    const last = this._lastMatrices;
     let moved = false;
 
-    this._meshes.forEach((mesh, i) => {
-      if (!this._lastMatrices[i].equals(mesh.matrixWorld)) {
-        this._lastMatrices[i].copy(mesh.matrixWorld);
+    this._units.forEach((unit, i) => {
+      const mesh = this._meshes[unit.mesh];
+      const drawn = isUnitDrawn(mesh, unit.instance);
+
+      if (drawn !== this._drawn[i]) {
+        this._drawn[i] = drawn;
         moved = true;
+      }
+
+      if (!drawn) return;
+
+      const elements = getUnitMatrix(mesh, unit.instance, _unitMatrix).elements;
+      const offset = i * 16;
+
+      for (let k = 0; k < 16; k++) {
+        if (last[offset + k] !== elements[k]) {
+          last.set(elements, offset);
+          moved = true;
+          break;
+        }
       }
     });
 
     return moved;
   }
 
+  // NOTE Snapshot of the transforms. Instances that are not drawn get a zero scale.
+  _updateProxies() {
+    for (const { proxy, mesh: m, instances } of this._proxies) {
+      const mesh = this._meshes[m];
+
+      proxy.matrixWorld.copy(mesh.matrixWorld);
+      proxy.castShadow = this._casters[m] && !this._excluded[m];
+
+      if (mesh.isInstancedMesh) {
+        proxy.instanceMatrix.array.set(mesh.instanceMatrix.array);
+        proxy.instanceMatrix.needsUpdate = true;
+        proxy.count = mesh.count;
+      } else if (instances !== null) {
+        instances.forEach((id, k) => {
+          if (isInstanceVisible(mesh, id)) mesh.getMatrixAt(id, _matrix);
+          else _matrix.makeScale(0, 0, 0);
+
+          proxy.setMatrixAt(k, _matrix);
+        });
+
+        proxy.instanceMatrix.needsUpdate = true;
+      }
+    }
+  }
+
   _startBake() {
-    this._meshes.forEach((mesh, i) => this._proxies[i].matrixWorld.copy(mesh.matrixWorld));
+    this._updateProxies();
 
     this._bakeLayout = this._layout;
     this._bakeKey = this._layoutKey;
-    setLayout(this._meshes, 'lightmapUvBake', this._bakeLayout);
+    this._writeLayout(this._bakeLayoutTexture, this._bakeLayout);
 
     // NOTE The first bake is on screen while it converges, so the front slot uses its layout
-    if (!this._hasFront) setLayout(this._meshes, SLOTS[this._front], this._bakeLayout);
+    if (!this._hasFront) this._writeLayout(this._layoutTextures[this._front], this._bakeLayout);
 
     const renderer = this.renderer;
     const previous = renderer.getRenderTarget();
@@ -510,12 +636,7 @@ export class EnvironmentShadowsBase {
     this._dirty = true;
     this._bakeKey = null;
 
-    for (const slot of SLOTS)
-      setLayout(
-        this._meshes,
-        slot,
-        this._meshes.map(() => null),
-      );
+    for (const texture of this._layoutTextures) this._writeLayout(texture, null);
   }
 
   /**
@@ -538,6 +659,7 @@ export class EnvironmentShadowsBase {
     if (!this._sample) return;
 
     const moved = this._detectMovement();
+    const excludeChanged = updateExcluded(this._meshes, this.exclude, this._excluded);
 
     // NOTE The visibility BVH is in world space
     if (moved) {
@@ -547,7 +669,7 @@ export class EnvironmentShadowsBase {
 
     this._moving = moved;
 
-    if ((moved && this.autoUpdate) || this.needsUpdate) {
+    if (((moved || excludeChanged) && this.autoUpdate) || this.needsUpdate) {
       this._dirty = true;
       this.needsUpdate = false;
     }
@@ -610,7 +732,7 @@ export class EnvironmentShadowsBase {
           const back = 1 - this._front;
 
           this._renderFinalize(this._lightmaps[back]);
-          setLayout(this._meshes, SLOTS[back], this._bakeLayout);
+          this._writeLayout(this._layoutTextures[back], this._bakeLayout);
 
           this._front = back;
           uniforms.frontIsA.value = back === 0 ? 1 : 0;
@@ -659,6 +781,9 @@ export class EnvironmentShadowsBase {
     }
 
     this._disposeTargets();
+    this._bakeLayoutTexture.dispose();
+    for (const texture of this._layoutTextures) texture.dispose();
+    for (const { proxy } of this._proxies) if (proxy.isInstancedMesh) proxy.dispose();
     this._bake.material.dispose();
     this._light.dispose();
     this._packer.dispose();

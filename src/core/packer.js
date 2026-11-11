@@ -9,9 +9,13 @@
 // NOTE The atlas UV of a vertex without a place in the layout
 export const NO_PLACE = -10;
 
+// NOTE Floats per layout entry: two RGBA texels, the rows of a 2x3 matrix (see layout.js)
+export const ENTRY_SIZE = 8;
+
 // NOTE Self-contained (no outside references), so its source can run in a worker
 function packerModule() {
   const NO_PLACE = -10;
+  const ENTRY_SIZE = 8;
 
   // NOTE Chart coordinates in the frame of its smallest bounding rect, in meters
   function chartPoint(chart, uv, v, target) {
@@ -257,54 +261,78 @@ function packerModule() {
     return { placements, missed, height: y + shelf };
   }
 
+  // NOTE An entry without a place: both rows give NO_PLACE
+  function emptyLayout(entryCount) {
+    const layout = new Float32Array(entryCount * ENTRY_SIZE);
+
+    for (let e = 0; e < entryCount; e++) {
+      layout[e * ENTRY_SIZE + 2] = NO_PLACE;
+      layout[e * ENTRY_SIZE + 6] = NO_PLACE;
+    }
+
+    return layout;
+  }
+
+  // NOTE A chart `scale` times larger: instance scale and visible charts
+  const scaleChart = (chart, scale) => ({
+    ...chart,
+    metersPerUv: chart.metersPerUv * scale,
+    width: chart.width * scale,
+    height: chart.height * scale,
+    worldArea: chart.worldArea * scale * scale,
+  });
+
   /**
-   * Packs the charts of the meshes with visible[ i ] === true into the atlas, at the largest texel density
-   * that fits. meshData[ i ] = { charts, uv (Float32Array, xatlas UVs), vertexCount }.
-   * With masks (screen hit counts), the visible charts (hits > 0) get `visibleScale` times more area.
-   * Returns per mesh a Float32Array of atlas UVs (2 per vertex), or null without a place.
+   * Packs the charts of the visible units, at the largest texel density that fits. Returns a layout: a 2x3
+   * transform per entry.
+   *
+   * @param {Array} geometries - { charts, uv } per geometry, uv: the xatlas UVs.
+   * @param {Array} units - { geometry, base } per unit, base: its first entry.
+   * @param {number} entryCount - Entries of all units.
+   * @param {Array<boolean>} visible - The units that get a place.
+   * @param {number} atlasSize - Atlas size in texels.
+   * @param {number} padding - Texels around each chart.
+   * @param {?Array<Uint32Array>} masks - Screen hits per unit chart. Visible charts get more area.
+   * @param {number} visibleScale - Area factor of the visible charts.
+   * @param {?Float32Array} scales - Chart scale per unit (instance scale).
    */
   function packCharts(
-    meshData,
+    geometries,
+    units,
+    entryCount,
     visible,
     atlasSize,
     padding = atlasPadding(atlasSize),
     masks = null,
     visibleScale = 2,
+    scales = null,
   ) {
     const charts = [];
 
-    meshData.forEach((mesh, meshIndex) => {
-      if (!visible[meshIndex]) return;
+    units.forEach((unit, u) => {
+      if (!visible[u]) return;
 
-      const mask = masks ? masks[meshIndex] : null;
+      const { charts: list, uv } = geometries[unit.geometry];
+      const mask = masks ? masks[u] : null;
+      const unitScale = scales ? scales[u] : 1;
 
-      mesh.charts.forEach((chart, c) => {
+      list.forEach((chart, c) => {
         if (chart.metersPerUv <= 0 || chart.worldArea <= 0) return;
 
-        if (!mask || mask[c] === 0 || visibleScale === 1) {
-          charts.push({ meshIndex, chart, uv: mesh.uv });
-          return;
-        }
-
-        const scale = Math.sqrt(visibleScale);
+        const visibleChart = mask && mask[c] > 0 && visibleScale !== 1;
+        const scale = unitScale * (visibleChart ? Math.sqrt(visibleScale) : 1);
 
         charts.push({
-          meshIndex,
-          chart: {
-            ...chart,
-            metersPerUv: chart.metersPerUv * scale,
-            width: chart.width * scale,
-            height: chart.height * scale,
-            worldArea: chart.worldArea * visibleScale,
-          },
-          uv: mesh.uv,
+          entry: unit.base + c,
+          chart: scale === 1 ? chart : scaleChart(chart, scale),
+          uv,
         });
       });
     });
 
-    const result = meshData.map(() => null);
+    const layout = emptyLayout(entryCount);
 
-    if (charts.length === 0) return result;
+    if (charts.length === 0) return layout;
 
     // NOTE The packing grid: cells of `texelsPerCell` texels, one texel per cell up to 2048
     const size = Math.min(atlasSize, 2048);
@@ -398,74 +426,74 @@ function packerModule() {
       );
     }
 
-    meshData.forEach((mesh, meshIndex) => {
-      if (visible[meshIndex])
-        result[meshIndex] = new Float32Array(mesh.vertexCount * 2).fill(NO_PLACE);
-    });
+    const k = texelsPerCell / atlasSize;
 
-    const point = [0, 0];
-
-    charts.forEach(({ meshIndex, chart, uv }, i) => {
+    // NOTE The per-vertex mapping as a 2x3 matrix: chart frame (rotation, offset, meters), cells, turn, flip, atlas
+    charts.forEach(({ entry, chart }, i) => {
       if (!best.placements[i]) return;
 
-      const uvs = result[meshIndex];
       const { x, y, variant } = best.placements[i];
-      const { h } = best.items[i].outlines[variant];
-      const turned = variant === 1 || variant === 3;
-      const flipped = variant >= 2;
+      const item = best.items[i];
+      const { h } = item.outlines[variant];
+      const s = chart.metersPerUv / item.cell;
 
-      for (const v of chart.vertices) {
-        chartPoint(chart, uv, v, point);
+      let a = [s * chart.cos, s * chart.sin, -s * chart.minU];
+      let b = [-s * chart.sin, s * chart.cos, -s * chart.minV];
 
-        // NOTE In cells. Turned / flipped charts are mirrored: the bake keeps the geometric normal, winding does not matter
-        let u = point[0] / best.items[i].cell;
-        let w = point[1] / best.items[i].cell;
+      // NOTE Turned / flipped charts are mirrored: the bake keeps the geometric normal, winding does not matter
+      if (variant === 1 || variant === 3) [a, b] = [b, a];
+      if (variant >= 2) b = [-b[0], -b[1], h - b[2]];
 
-        if (turned) [u, w] = [w, u];
+      const o = entry * ENTRY_SIZE;
 
-        if (flipped) w = h - w;
-
-        uvs[v * 2] = ((pad + x + u) * texelsPerCell) / atlasSize;
-        uvs[v * 2 + 1] = ((y + w) * texelsPerCell) / atlasSize;
-      }
+      layout[o] = k * a[0];
+      layout[o + 1] = k * a[1];
+      layout[o + 2] = k * (a[2] + pad + x);
+      layout[o + 4] = k * b[0];
+      layout[o + 5] = k * b[1];
+      layout[o + 6] = k * (b[2] + y);
     });
 
-    return result;
+    return layout;
   }
 
-  return { packCharts };
+  return { packCharts, emptyLayout };
 }
 
+/** Layout without a place for any of the `entryCount` entries. */
+export const emptyLayout = (entryCount) => packerModule().emptyLayout(entryCount);
+
 /**
- * Creates a packer for the given meshes. pack( visible, atlasSize ) resolves with one Float32Array
- * (2 atlas UVs per vertex) or null per mesh.
+ * Creates a packer, see packCharts. pack( visible, atlasSize, masks, visibleScale, scales ) resolves with a layout.
  *
- * @param {Array<Mesh>} meshes - Unwrapped meshes, see unwrap.js.
- * @return {{pack: function(Array<boolean>, number): Promise<Array<?Float32Array>>, dispose: function()}}
+ * @param {Array<{charts: Array, uv: Float32Array}>} geometries - Unwrapped geometries, see unwrap.js.
+ * @param {Array<{geometry: number, base: number}>} units - The geometry and first layout entry of each unit.
+ * @param {number} entryCount - Layout entries of all units.
  */
-export function createPacker(meshes) {
-  const meshData = meshes.map((mesh) => ({
-    charts: mesh.userData.environmentShadowCharts ?? [],
-    uv: mesh.geometry.attributes.lightmapUv?.array.slice() ?? new Float32Array(0),
-    vertexCount: mesh.geometry.attributes.position.count,
+export function createPacker(geometries, units, entryCount) {
+  // NOTE Plain copies, the worker needs no vertex lists
+  const geometryData = geometries.map(({ charts, uv }) => ({
+    charts: charts.map(({ vertices, ...chart }) => chart),
+    uv,
   }));
+  const unitData = units.map(({ geometry, base }) => ({ geometry, base }));
 
   let worker = null;
   let url = null;
 
   if (typeof Worker !== 'undefined') {
     const body = `const { packCharts } = ( ${packerModule.toString()} )();
-      let meshData = null;
+      let data = null;
       self.onmessage = ( event ) => {
         const message = event.data;
-        if ( message.type === 'init' ) { meshData = message.meshData; return; }
-        const layout = packCharts( meshData, message.visible, message.atlasSize, undefined, message.masks, message.visibleScale );
-        self.postMessage( { id: message.id, layout }, layout.filter( Boolean ).map( ( uvs ) => uvs.buffer ) );
+        if ( message.type === 'init' ) { data = message; return; }
+        const layout = packCharts( data.geometries, data.units, data.entryCount, message.visible, message.atlasSize, undefined, message.masks, message.visibleScale, message.scales );
+        self.postMessage( { id: message.id, layout }, [ layout.buffer ] );
       };`;
 
     url = URL.createObjectURL(new Blob([body], { type: 'application/javascript' }));
     worker = new Worker(url);
-    worker.postMessage({ type: 'init', meshData });
+    worker.postMessage({ type: 'init', geometries: geometryData, units: unitData, entryCount });
   }
 
   const { packCharts } = packerModule();
@@ -482,17 +510,27 @@ export function createPacker(meshes) {
   }
 
   return {
-    pack(visible, atlasSize, masks = null, visibleScale = 2) {
+    pack(visible, atlasSize, masks = null, visibleScale = 2, scales = null) {
       if (!worker)
         return Promise.resolve(
-          packCharts(meshData, visible, atlasSize, undefined, masks, visibleScale),
+          packCharts(
+            geometryData,
+            unitData,
+            entryCount,
+            visible,
+            atlasSize,
+            undefined,
+            masks,
+            visibleScale,
+            scales,
+          ),
         );
 
       const id = nextId++;
 
       return new Promise((resolve) => {
         pending.set(id, resolve);
-        worker.postMessage({ type: 'pack', id, visible, atlasSize, masks, visibleScale });
+        worker.postMessage({ type: 'pack', id, visible, atlasSize, masks, visibleScale, scales });
       });
     },
 

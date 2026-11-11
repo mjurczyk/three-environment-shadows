@@ -9,7 +9,13 @@ import {
   Texture,
   Vector3,
 } from 'three';
-import { LightingNode, MeshLambertNodeMaterial, NodeMaterial, QuadMesh } from 'three/webgpu';
+import {
+  LightingNode,
+  MeshBasicNodeMaterial,
+  MeshLambertNodeMaterial,
+  NodeMaterial,
+  QuadMesh,
+} from 'three/webgpu';
 import {
   Fn,
   If,
@@ -18,8 +24,11 @@ import {
   clamp,
   cross,
   dot,
+  drawIndex,
   float,
   hash,
+  instanceIndex,
+  int,
   ivec2,
   max,
   mix,
@@ -32,16 +41,73 @@ import {
   select,
   texture,
   textureLoad,
+  textureSize,
   uniform,
+  varying,
+  vec2,
   vec3,
   vec4,
 } from 'three/tsl';
+import { NO_PLACE } from '../core/packer.js';
+import { CHART_ATTRIBUTE } from '../core/unwrap.js';
+import { LAYOUT_WIDTH } from '../core/units.js';
 
 /**
  * TSL backend for WebGPURenderer (WebGPU and its WebGL 2 fallback): node materials.
  *
  * @private
  */
+
+// NOTE The instance of the vertex: of an InstancedMesh, or the instance id of a BatchedMesh (as in three.js batch())
+function getInstance(builder) {
+  const object = builder.object;
+
+  if (object.isInstancedMesh) return int(instanceIndex);
+  if (!object.isBatchedMesh) return int(0);
+
+  const id = int(builder.getDrawIndex() === null ? instanceIndex : drawIndex);
+  const indirect = object._indirectTexture;
+  const size = int(textureSize(textureLoad(indirect), 0).x);
+
+  return int(textureLoad(indirect, ivec2(id.mod(size), id.div(size))).x);
+}
+
+// NOTE The atlas UV of the vertex in a layout texture, see units.js. NO_PLACE without a place or chart attribute.
+function getAtlasUv(layout, builder) {
+  if (!builder.hasGeometryAttribute(CHART_ATTRIBUTE)) return vec2(NO_PLACE);
+
+  return Fn(() => {
+    const chart = attribute(CHART_ATTRIBUTE, 'vec3');
+    const uv = vec3(attribute('lightmapUv', 'vec2'), 1);
+    const instance = getInstance(builder);
+    const texel = (t) => textureLoad(layout, ivec2(t.mod(LAYOUT_WIDTH), t.div(LAYOUT_WIDTH)));
+
+    const index = int(chart.x.add(0.5)).sub(1).toVar();
+    const base = int(chart.y.add(0.5).floor()).toVar();
+
+    If(chart.z.lessThan(-0.5), () => {
+      base.assign(int(texel(base.add(instance).mul(2)).x.add(0.5).floor()));
+    }).Else(() => {
+      base.addAssign(instance.mul(int(chart.z.add(0.5))));
+    });
+
+    const result = vec2(NO_PLACE).toVar();
+
+    If(index.greaterThanEqual(0).and(base.greaterThanEqual(0)), () => {
+      const t = base.add(index).mul(2);
+
+      result.assign(vec2(dot(texel(t).xyz, uv), dot(texel(t.add(1)).xyz, uv)));
+    });
+
+    return result;
+  })();
+}
+
+// NOTE The atlas UVs of slots A and B, computed per vertex
+const getDisplayUvs = (display, builder) => ({
+  uvA: varying(getAtlasUv(display.layoutA, builder)),
+  uvB: varying(getAtlasUv(display.layoutB, builder)),
+});
 
 // NOTE The baked lightmap replaces the environment diffuse (iblIrradiance), its visibility occludes the
 // environment specular (radiance). Runs after the environment node in the material lighting list.
@@ -59,6 +125,7 @@ class EnvironmentShadowsLightingNode extends LightingNode {
   setup(builder) {
     const { iblIrradiance, radiance } = builder.context;
     const display = this.display;
+    const { uvA, uvB } = getDisplayUvs(display, builder);
 
     const unoccluded = vec3(iblIrradiance).toVar();
 
@@ -68,15 +135,15 @@ class EnvironmentShadowsLightingNode extends LightingNode {
       ? reference('envMapIntensity', 'float', builder.material)
       : reference('environmentIntensity', 'float', builder.scene);
 
-    // NOTE Atlas UVs are > 0, meshes without a place (UV -10) keep the unoccluded light
+    // NOTE Atlas UVs are > 0, units without a place (UV -10) keep the unoccluded light
     const valueA = select(
-      display.uvA.x.greaterThan(1e-6),
-      display.sampleA.rgb.mul(intensity),
+      uvA.x.greaterThan(1e-6),
+      texture(display.a, uvA).rgb.mul(intensity),
       unoccluded,
     );
     const valueB = select(
-      display.uvB.x.greaterThan(1e-6),
-      display.sampleB.rgb.mul(intensity),
+      uvB.x.greaterThan(1e-6),
+      texture(display.b, uvB).rgb.mul(intensity),
       unoccluded,
     );
     const frontIsA = display.frontIsA.greaterThan(0.5);
@@ -144,6 +211,8 @@ export const tslBackend = {
       mapTexel: uniform(1 / 512),
       shadowExtent: uniform(1),
       lightDirection: uniform(new Vector3(0, 1, 0)),
+      // NOTE The layout texture of the bake, a placeholder here
+      layout: texture(new Texture()),
     };
 
     const material = new MeshLambertNodeMaterial({
@@ -165,13 +234,17 @@ export const tslBackend = {
     material.shadowSide = BackSide;
 
     // NOTE The atlas UV of this bake, v = 0 at the top (TSL follows the WebGPU conventions on both backends).
-    // Meshes without a place (UV -10) are outside the clip space.
-    const uv = attribute('lightmapUvBake', 'vec2');
-    material.vertexNode = vec4(uv.x.mul(2).sub(1), float(1).sub(uv.y.mul(2)), 0, 1);
+    // Units without a place (UV -10) are outside the clip space.
+    material.vertexNode = Fn((builder) => {
+      const uv = getAtlasUv(uniforms.layout, builder);
 
-    // NOTE The winding in lightmap space is arbitrary (charts can be mirrored), keep the geometric normal
+      return vec4(uv.x.mul(2).sub(1), float(1).sub(uv.y.mul(2)), 0, 1);
+    })();
+
+    // NOTE Charts can be mirrored, so keep the geometric normal. The varying reads normalLocal in the vertex
+    // stage, with the instance transform.
     material.normalNode = cameraViewMatrix
-      .mul(vec4(modelNormalMatrix.mul(normalLocal), 0))
+      .mul(vec4(varying(modelNormalMatrix.mul(normalLocal)), 0))
       .xyz.normalize();
 
     // NOTE Shadow noise: a random offset of the shadow lookup, across the light direction (three.js r176+)
@@ -247,17 +320,16 @@ export const tslBackend = {
     quad.render(renderer);
   },
 
-  createDisplay() {
-    const uvA = attribute('lightmapUvA', 'vec2');
-    const uvB = attribute('lightmapUvB', 'vec2');
+  supportsBatchedMesh: true,
 
+  createDisplay() {
     const display = {
-      uvA,
-      uvB,
-      // NOTE The lightmap textures stay the same (slots A and B), a swap only flips frontIsA. They are
-      // placeholders here, EnvironmentShadowsBase sets the lightmaps before any material builds.
-      sampleA: texture(new Texture(), uvA),
-      sampleB: texture(new Texture(), uvB),
+      // NOTE Lightmap and layout textures of slots A and B. Placeholders: EnvironmentShadowsBase sets them
+      // before any material builds.
+      a: texture(new Texture()),
+      b: texture(new Texture()),
+      layoutA: texture(new Texture()),
+      layoutB: texture(new Texture()),
       // NOTE Render group: updated every render. Object group uniforms of materials without node properties
       // are only refreshed when three.js sees the material or object change, value changes would be lost.
       frontIsA: uniform(1).setGroup(renderGroup),
@@ -273,8 +345,10 @@ export const tslBackend = {
 
     return {
       uniforms: {
-        a: display.sampleA,
-        b: display.sampleB,
+        a: display.a,
+        b: display.b,
+        layoutA: display.layoutA,
+        layoutB: display.layoutB,
         frontIsA: display.frontIsA,
         blend: display.blend,
         valid: display.valid,
@@ -286,6 +360,22 @@ export const tslBackend = {
       // NOTE New lightmap textures (another atlas size) need a rebuild of the patched materials
       refresh() {
         for (const material of materials) material.needsUpdate = true;
+      },
+
+      // NOTE Debug view: the front lightmap, magenta where a unit has no place in the atlas
+      createLightmapMaterial() {
+        const material = new MeshBasicNodeMaterial();
+
+        material.colorNode = Fn((builder) => {
+          const { uvA, uvB } = getDisplayUvs(display, builder);
+          const frontIsA = display.frontIsA.greaterThan(0.5);
+          const uv = select(frontIsA, uvA, uvB);
+          const color = select(frontIsA, texture(display.a, uvA), texture(display.b, uvB));
+
+          return select(uv.x.greaterThan(1e-6), color.rgb, vec3(1, 0, 1));
+        })();
+
+        return material;
       },
 
       patch(material) {
