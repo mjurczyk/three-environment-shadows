@@ -1,4 +1,4 @@
-import type { Camera, Scene, Sphere } from 'three';
+import type { Camera, Object3D, Scene, Sphere } from 'three';
 import type { WebGPURenderer } from 'three/webgpu';
 import type { EnvironmentShadowsOptions } from './index.js';
 
@@ -31,6 +31,7 @@ export class EnvironmentShadows {
   shadowBalance: number;
   autoUpdate: boolean;
   bounds: Sphere | null;
+  exclude: Set<Object3D>;
   needsUpdate: boolean;
 
   readonly ready: Promise<this>;

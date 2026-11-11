@@ -1,4 +1,4 @@
-import type { Camera, Mesh, Scene, Sphere, WebGLRenderer } from 'three';
+import type { Camera, Mesh, Object3D, Scene, Sphere, WebGLRenderer } from 'three';
 
 /**
  * Options of {@link EnvironmentShadows}, see the properties of the same name.
@@ -38,6 +38,8 @@ export interface EnvironmentShadowsOptions {
   bounds?: Sphere;
   /** The meshes. Default: all meshes of the scene that cast or receive shadows. */
   meshes?: Mesh[];
+  /** Objects whose meshes (children included) do not cast shadows. They still receive shadows. Default: none. */
+  exclude?: Iterable<Object3D>;
   /** URL of xatlas-web.wasm. Default: next to the bundle. */
   xatlasWasmUrl?: string;
 }
@@ -70,6 +72,11 @@ export class EnvironmentShadows {
   autoUpdate: boolean;
   /** The area that receives shadows, set when {@link ready} resolves if not given. */
   bounds: Sphere | null;
+  /**
+   * Objects whose meshes (children included) do not cast shadows. Changes apply to the next bake,
+   * with `autoUpdate` a change starts one.
+   */
+  exclude: Set<Object3D>;
   /** Set to `true` to start a new bake, e.g. after a change of the options. */
   needsUpdate: boolean;
 
